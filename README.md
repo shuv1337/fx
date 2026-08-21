@@ -27,7 +27,11 @@ curl -fsSL https://fx.sh/setup.sh | bash
 
 ## Run fx
 
-To get started, sign in with Vercel:
+In interactive fx, run `/login` to choose Vercel, Anthropic Claude, OpenAI
+Codex, or xAI Grok. You can sign in with a provider account or subscription
+without configuring an API key first.
+
+From a shell, sign in with Vercel using:
 
 ```bash
 fx login

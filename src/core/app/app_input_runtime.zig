@@ -3219,6 +3219,7 @@ const RoutingFakeApp = struct {
     load_more_session_count: usize = 0,
     selected_credential_source: ?types.CredentialSource = null,
     selected_auth_action: ?auth_runtime.AcquisitionAction = null,
+    selected_auth_provider: ?auth_runtime.LoginProvider = null,
     selected_auth_team: ?usize = null,
     upgrade_apply_count: usize = 0,
     upgrade_denied_count: usize = 0,
@@ -3458,6 +3459,7 @@ const RoutingFakeApp = struct {
         switch (choice) {
             .source => |source| _ = try self.selectCredentialSource(source),
             .action => |action| self.selected_auth_action = action,
+            .provider => |provider| self.selected_auth_provider = provider,
             .team => |index| self.selected_auth_team = index,
         }
     }

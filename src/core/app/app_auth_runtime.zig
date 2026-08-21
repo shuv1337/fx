@@ -7,6 +7,8 @@ const io_mod = @import("../shared/io.zig");
 const credentials = @import("../auth/credentials.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
 const login_flow = @import("../auth/login_flow.zig");
+const provider_login_flow = @import("../auth/provider_login_flow.zig");
+const provider_oauth = @import("../auth/provider_oauth.zig");
 const types = @import("../shared/types.zig");
 
 fn oauthAuthEnabled(comptime App: type) bool {
@@ -43,7 +45,7 @@ pub fn Runtime(comptime App: type) type {
                 }, true);
                 return;
             }
-            try beginSignIn(app, false);
+            try beginProviderSelection(app, false);
         }
 
         pub fn runLogoutCommand(app: *App) !void {
@@ -130,7 +132,7 @@ pub fn Runtime(comptime App: type) type {
             switch (choice) {
                 .source => |source| try applySourceChoice(app, source),
                 .action => |action| switch (action) {
-                    .login => try beginSignIn(app, true),
+                    .login => try beginProviderSelection(app, true),
                     .setup => {
                         if (comptime !runtime_profile.allows(App, .native_auth)) {
                             try app.writeDomainNotice(.{
@@ -147,15 +149,19 @@ pub fn Runtime(comptime App: type) type {
                     .switch_credential => app.auth.openSwitchCredentialPicker(app.alloc),
                     .automatic => try applyAutomaticCredential(app),
                 },
+                .provider => |provider| try beginProviderSignIn(app, provider),
                 .team => |index| try applyTeamChoice(app, index),
             }
         }
 
         pub fn routeAuthPickerByte(app: *App, byte: u8) !bool {
-            if (app.auth.signInEntryActive()) {
+            if (app.auth.signInEntryActive() or app.auth.providerSignInEntryActive()) {
                 switch (byte) {
                     3, 4 => _ = app.auth.popPickerStage(app.alloc),
-                    '\r', '\n' => try openSignInBrowser(app),
+                    '\r', '\n' => if (app.auth.providerSignInEntryActive())
+                        try openProviderSignInBrowser(app)
+                    else
+                        try openSignInBrowser(app),
                     else => {},
                 }
                 app.shell.render_requests.request(.footer);
@@ -183,7 +189,7 @@ pub fn Runtime(comptime App: type) type {
         }
 
         pub fn routeAuthPickerEscapeAction(app: *App, action: anytype) bool {
-            if (!app.auth.signInEntryActive() and !app.auth.apiKeyEntryActive()) return false;
+            if (!app.auth.signInEntryActive() and !app.auth.providerSignInEntryActive() and !app.auth.apiKeyEntryActive()) return false;
             return switch (action) {
                 .escape, .remapped_byte => false,
                 else => true,
@@ -219,13 +225,45 @@ pub fn Runtime(comptime App: type) type {
                     if (selection.teams.items.len > 0) {
                         app.auth.openTeamPicker(app.alloc, &selection);
                     } else {
-                        _ = app.auth.popPickerStage(app.alloc);
+                        app.auth.closePicker(app.alloc);
                     }
                     try writeAuthNotice(app, .{
                         .topic = "auth",
                         .tone = .neutral,
                         .body = "Signed in to Vercel.",
                     });
+                },
+            }
+
+            if (!app.auth.providerSignInEntryActive()) return;
+            if (app.auth.takeProviderSignInProgressChanged()) app.shell.render_requests.request(.footer);
+            switch (app.auth.pollProviderSignInTransition(app.alloc)) {
+                .none => {},
+                .cancelled => app.shell.render_requests.request(.footer),
+                .failed => |err| {
+                    debug_trace.logf("auth", "provider login failed err={s}", .{@errorName(err)});
+                    if (!app.auth.providerSignInEntryActive()) return;
+                    _ = app.auth.popPickerStage(app.alloc);
+                    try writeProviderLoginError(app, err);
+                },
+                .succeeded => |provider| {
+                    if (!app.auth.providerSignInEntryActive()) return;
+                    try app.auth.refreshSourceInventory(app.alloc);
+                    const source = provider.credentialSource();
+                    if (!try selectCredentialSource(app, source)) {
+                        _ = app.auth.popPickerStage(app.alloc);
+                        try writeAuthNotice(app, .{
+                            .topic = "auth",
+                            .tone = .@"error",
+                            .body = "Signed in, but the provider credential could not be loaded.",
+                        });
+                        return;
+                    }
+                    rememberCredentialSource(app, source);
+                    app.auth.closePicker(app.alloc);
+                    const body = try std.fmt.allocPrint(app.alloc, "Signed in to {s}.", .{provider.label()});
+                    defer app.alloc.free(body);
+                    try writeAuthNotice(app, .{ .topic = "auth", .tone = .neutral, .body = body });
                 },
             }
         }
@@ -479,11 +517,72 @@ pub fn Runtime(comptime App: type) type {
             }
         }
 
+        fn beginProviderSelection(app: *App, from_root: bool) !void {
+            if (comptime runtime_profile.allows(App, .native_auth)) {
+                app.auth.openLoginProviderPicker(app.alloc, from_root);
+                app.shell.render_requests.request(.footer);
+            } else {
+                try beginSignIn(app, from_root);
+            }
+        }
+
+        fn beginProviderSignIn(app: *App, provider: auth_runtime.LoginProvider) !void {
+            if (provider == .vercel) {
+                const started = app.auth.openSignInPickerFromProvider(app.alloc) catch |err| {
+                    debug_trace.logf("auth", "login failed err={s}", .{@errorName(err)});
+                    app.auth.reopenLoginProviderPicker(.vercel);
+                    try writeLoginError(app, err);
+                    return;
+                };
+                if (started) {
+                    app.shell.render_requests.request(.footer);
+                    if (io_mod.getenv("FX_NO_OPEN_BROWSER") == null) try openSignInBrowser(app);
+                } else {
+                    app.auth.reopenLoginProviderPicker(.vercel);
+                    app.shell.render_requests.request(.footer);
+                }
+                return;
+            }
+            if (comptime !runtime_profile.allows(App, .native_auth)) return;
+            try app.flushBeforeBlockingExternalWork();
+            const managed = provider.managed().?;
+            const opener = if (io_mod.getenv("FX_NO_OPEN_BROWSER") == null)
+                app.urlOpener()
+            else
+                host.unavailable_url_opener;
+            const started = app.auth.openProviderSignInPicker(app.alloc, managed, opener) catch |err| {
+                app.auth.reopenLoginProviderPicker(provider);
+                app.shell.render_requests.request(.footer);
+                try writeProviderLoginError(app, err);
+                return;
+            };
+            if (started) {
+                app.shell.render_requests.request(.footer);
+            } else {
+                app.auth.reopenLoginProviderPicker(provider);
+                app.shell.render_requests.request(.footer);
+                try app.writeDomainNotice(.{
+                    .topic = "auth",
+                    .tone = .warning,
+                    .body = "The previous provider sign-in is still stopping. Try again in a moment.",
+                }, true);
+            }
+        }
+
         fn openSignInBrowser(app: *App) !void {
             const url = (try app.auth.signInBrowserUrlAlloc(app.alloc)) orelse return;
             defer app.alloc.free(url);
             if (!try app.urlOpener().open(app.alloc, url)) {
                 debug_trace.logf("auth", "login browser launcher failed", .{});
+            }
+        }
+
+        fn openProviderSignInBrowser(app: *App) !void {
+            if (io_mod.getenv("FX_NO_OPEN_BROWSER") != null) return;
+            const url = (try app.auth.providerSignInBrowserUrlAlloc(app.alloc)) orelse return;
+            defer app.alloc.free(url);
+            if (!try app.urlOpener().open(app.alloc, url)) {
+                debug_trace.logf("auth", "provider login browser launcher failed", .{});
             }
         }
 
@@ -589,6 +688,15 @@ pub fn Runtime(comptime App: type) type {
             try writeAuthNotice(app, notice);
         }
 
+        fn writeProviderLoginError(app: *App, err: anyerror) !void {
+            const notice: types.SemanticNotice = switch (err) {
+                error.AccessDenied => .{ .topic = "auth", .tone = .@"error", .body = "Provider sign-in was denied. The current credential is unchanged." },
+                error.ExpiredToken, error.LoginTimedOut => .{ .topic = "auth", .tone = .warning, .body = "The provider sign-in expired. The current credential is unchanged; run /login to try again." },
+                else => .{ .topic = "auth", .tone = .@"error", .body = "Provider sign-in failed. The current credential is unchanged." },
+            };
+            try writeAuthNotice(app, notice);
+        }
+
         fn writeAuthNotice(app: *App, notice: types.SemanticNotice) !void {
             try app.writeDomainNotice(notice, true);
             app.shell.render_requests.request(.first_frame);
@@ -675,6 +783,18 @@ const TestAuth = struct {
     }
 
     fn pulseSignIn(_: *TestAuth, _: std.mem.Allocator) void {}
+
+    fn pollProviderSignInTransition(_: *TestAuth, _: std.mem.Allocator) provider_login_flow.Transition {
+        return .none;
+    }
+
+    fn takeProviderSignInProgressChanged(_: *TestAuth) bool {
+        return false;
+    }
+
+    fn providerSignInEntryActive(_: *const TestAuth) bool {
+        return false;
+    }
 
     fn popPickerStage(self: *TestAuth, _: std.mem.Allocator) bool {
         self.picker_pop_count += 1;

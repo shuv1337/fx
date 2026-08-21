@@ -54,6 +54,7 @@ fn teamQueryProjection(query: []const u8, width: u16) TeamQueryProjection {
 
 pub fn authPickerRowCount(view: auth_runtime.PickerView) u16 {
     if (view.stage == .sign_in) return 7;
+    if (view.stage == .provider_sign_in) return 7;
     if (view.stage == .api_key) return 4;
     if (view.stage == .root and view.include_skip) return 17;
     return @intCast(1 + @max(view.choiceCount(), 1));
@@ -68,6 +69,9 @@ pub noinline fn composeAuthPickerRow(
 ) !std.ArrayList(u8) {
     if (view.stage == .sign_in) {
         return composeSignInPickerRow(alloc, view.sign_in, row_index, width);
+    }
+    if (view.stage == .provider_sign_in) {
+        return composeProviderSignInPickerRow(alloc, view.provider_sign_in, row_index, width);
     }
     if (view.stage == .api_key) {
         return composeApiKeyPickerRow(alloc, view.api_key_mask_count, row_index, width);
@@ -92,7 +96,9 @@ pub noinline fn composeAuthPickerRow(
         }
         const header = switch (view.stage) {
             .root => "   Setup",
+            .login_provider => "   Sign in with a provider",
             .sign_in => unreachable,
+            .provider_sign_in => unreachable,
             .api_key => unreachable,
             .change_team => unreachable,
             .switch_credential => "   Use this credential",
@@ -114,7 +120,9 @@ pub noinline fn composeAuthPickerRow(
         try row.appendSlice(alloc, ui_render.dim_style);
         try row_text.appendClipped(alloc, &row, switch (view.stage) {
             .root => "",
+            .login_provider => "     No providers available",
             .sign_in => unreachable,
+            .provider_sign_in => unreachable,
             .api_key => unreachable,
             .change_team => if (view.team_query.len == 0)
                 "     No Vercel teams available"
@@ -274,6 +282,53 @@ fn composeSignInPickerRow(
     return row;
 }
 
+fn composeProviderSignInPickerRow(
+    alloc: Allocator,
+    snapshot: @import("../../core/auth/provider_login_flow.zig").Snapshot,
+    row_index: u16,
+    width: u16,
+) !std.ArrayList(u8) {
+    var row: std.ArrayList(u8) = .empty;
+    errdefer row.deinit(alloc);
+    if (width == 0) return row;
+
+    try row.appendSlice(
+        alloc,
+        if (row_index == 2 or row_index == 3)
+            ui_render.selected_completion_style
+        else
+            ui_render.dim_style,
+    );
+    var label_buf: [1024]u8 = undefined;
+    const provider_label = if (snapshot.provider) |provider| provider.label() else "provider";
+    const label = switch (row_index) {
+        0 => std.fmt.bufPrint(&label_buf, "   Sign in to {s}", .{provider_label}) catch "   Sign in to provider",
+        1, 4 => "",
+        2 => if (snapshot.authorization_url.len == 0)
+            "   Preparing a secure authorization link…"
+        else
+            std.fmt.bufPrint(&label_buf, "   Open   {s}", .{snapshot.authorization_url}) catch "   Open the provider authorization page",
+        3 => if (snapshot.user_code) |code|
+            std.fmt.bufPrint(&label_buf, "   Code   {s}", .{code}) catch "   Authorization code unavailable"
+        else if (snapshot.authorization_url.len > 0)
+            "   Complete authorization in your browser"
+        else
+            "",
+        5 => switch (snapshot.state) {
+            .idle => "   Preparing sign-in…",
+            .polling => if (snapshot.authorization_url.len == 0) "   Contacting provider…" else "   Waiting for authorization…",
+            .succeeded => "   Authorization complete",
+            .failed => "   Sign-in failed",
+            .cancelled => "   Sign-in cancelled",
+        },
+        6 => "   Enter reopens browser · Esc cancels",
+        else => "",
+    };
+    try row_text.appendClipped(alloc, &row, label, width);
+    try row.appendSlice(alloc, ui_render.reset_style);
+    return row;
+}
+
 fn composeApiKeyPickerRow(
     alloc: Allocator,
     mask_count: usize,
@@ -338,7 +393,7 @@ pub fn activeListPickerReservedRows(terminal_rows: u16, input_extra: u16, banner
 }
 
 pub fn authPickerReservedRows(view: auth_runtime.PickerView, terminal_rows: u16, input_extra: u16, banner_rows: u16) u16 {
-    if (view.stage == .sign_in or (view.stage == .root and view.include_skip)) {
+    if (view.stage == .sign_in or view.stage == .provider_sign_in or (view.stage == .root and view.include_skip)) {
         const available_rows = terminal_rows -| (5 +| input_extra +| banner_rows);
         return @min(authPickerRowCount(view), @max(available_rows, 1));
     }
@@ -1556,7 +1611,7 @@ test "auth onboarding composes the welcome copy and setup choices" {
     try std.testing.expect(std.mem.find(u8, screen.items, "You can change this anytime with /setup.") != null);
     try std.testing.expect(std.mem.find(u8, screen.items, "⚠︎ Note: fx is experimental and defaults to auto mode. \x1b]8;id=fx-onboarding;https://fx.sh/docs/stability\x1b\\\x1b[4mLearn more\x1b[24m\x1b]8;;\x1b\\") != null);
     try std.testing.expect(std.mem.find(u8, screen.items, "Learn more: https://") == null);
-    try std.testing.expect(std.mem.find(u8, screen.items, "Sign in with Vercel") != null);
+    try std.testing.expect(std.mem.find(u8, screen.items, "Sign in with a provider") != null);
     try std.testing.expect(std.mem.find(u8, screen.items, "Add an API key") != null);
     try std.testing.expect(std.mem.find(u8, screen.items, "Esc to set up later · Explore all commands with /help") != null);
 
@@ -1570,7 +1625,7 @@ test "auth onboarding composes the welcome copy and setup choices" {
 
     var selected_row = try composeAuthPickerRow(alloc, view, 8, authPickerRowCount(view), 100);
     defer selected_row.deinit(alloc);
-    try std.testing.expect(std.mem.find(u8, selected_row.items, "› Sign in with Vercel") != null);
+    try std.testing.expect(std.mem.find(u8, selected_row.items, "› Sign in with a provider") != null);
 
     var unselected_row = try composeAuthPickerRow(alloc, view, 9, authPickerRowCount(view), 100);
     defer unselected_row.deinit(alloc);
@@ -1588,7 +1643,7 @@ test "auth onboarding composes the welcome copy and setup choices" {
         try compact_screen.appendSlice(alloc, row.items);
         try compact_screen.append(alloc, '\n');
     }
-    try std.testing.expect(std.mem.find(u8, compact_screen.items, "Sign in with Vercel") != null);
+    try std.testing.expect(std.mem.find(u8, compact_screen.items, "Sign in with a provider") != null);
     try std.testing.expect(std.mem.find(u8, compact_screen.items, "Add an API key") != null);
     try std.testing.expect(std.mem.find(u8, compact_screen.items, "Esc to set up later") != null);
 }
@@ -1611,7 +1666,7 @@ test "auth picker composes only detected credential sources" {
 
     var sign_in = try composeAuthPickerRow(alloc, view, 1, row_count, 80);
     defer sign_in.deinit(alloc);
-    try std.testing.expect(std.mem.find(u8, sign_in.items, "Sign in with Vercel") != null);
+    try std.testing.expect(std.mem.find(u8, sign_in.items, "Sign in with a provider") != null);
 
     var setup = try composeAuthPickerRow(alloc, view, 2, row_count, 80);
     defer setup.deinit(alloc);
@@ -1625,6 +1680,67 @@ test "auth picker composes only detected credential sources" {
     var switch_credential = try composeAuthPickerRow(alloc, view, 4, row_count, 80);
     defer switch_credential.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, switch_credential.items, "Switch credential") != null);
+}
+
+test "login provider picker makes account choices and subscriptions explicit" {
+    const alloc = std.testing.allocator;
+    const view = auth_runtime.PickerView{
+        .active = true,
+        .available_sources = .empty,
+        .selected_choice = .{ .provider = .anthropic },
+        .active_source = null,
+        .include_skip = false,
+        .stage = .login_provider,
+    };
+    const row_count = authPickerRowCount(view);
+    try std.testing.expectEqual(@as(u16, 5), row_count);
+
+    var screen: std.ArrayList(u8) = .empty;
+    defer screen.deinit(alloc);
+    for (0..row_count) |row_index| {
+        var row = try composeAuthPickerRow(alloc, view, @intCast(row_index), row_count, 100);
+        defer row.deinit(alloc);
+        try screen.appendSlice(alloc, row.items);
+        try screen.append(alloc, '\n');
+    }
+
+    try std.testing.expect(std.mem.find(u8, screen.items, "Sign in with a provider") != null);
+    try std.testing.expect(std.mem.find(u8, screen.items, "Vercel account · AI Gateway") != null);
+    try std.testing.expect(std.mem.find(u8, screen.items, "Claude Pro or Max subscription") != null);
+    try std.testing.expect(std.mem.find(u8, screen.items, "ChatGPT Plus, Pro, or Team") != null);
+    try std.testing.expect(std.mem.find(u8, screen.items, "Grok or X account") != null);
+}
+
+test "provider sign-in renders authorization URL code and wait state" {
+    const alloc = std.testing.allocator;
+    const view = auth_runtime.PickerView{
+        .active = true,
+        .available_sources = .empty,
+        .selected_choice = null,
+        .active_source = null,
+        .include_skip = false,
+        .stage = .provider_sign_in,
+        .provider_sign_in = .{
+            .provider = .xai,
+            .state = .polling,
+            .authorization_url = "https://auth.x.ai/device",
+            .user_code = "TEST-CODE",
+        },
+    };
+
+    var screen: std.ArrayList(u8) = .empty;
+    defer screen.deinit(alloc);
+    for (0..authPickerRowCount(view)) |row_index| {
+        var row = try composeAuthPickerRow(alloc, view, @intCast(row_index), authPickerRowCount(view), 100);
+        defer row.deinit(alloc);
+        try screen.appendSlice(alloc, row.items);
+        try screen.append(alloc, '\n');
+    }
+
+    try std.testing.expect(std.mem.find(u8, screen.items, "Sign in to xAI Grok/X") != null);
+    try std.testing.expect(std.mem.find(u8, screen.items, "https://auth.x.ai/device") != null);
+    try std.testing.expect(std.mem.find(u8, screen.items, "TEST-CODE") != null);
+    try std.testing.expect(std.mem.find(u8, screen.items, "Waiting for authorization") != null);
 }
 
 test "compact auth picker keeps the selected hub action visible" {

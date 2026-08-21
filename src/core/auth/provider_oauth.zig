@@ -94,6 +94,51 @@ pub const Provider = enum {
 
 pub const LoginMethod = enum { browser, device_code, manual_code };
 
+pub const Authorization = struct {
+    url: []const u8,
+    user_code: ?[]const u8 = null,
+};
+
+pub const LoginObserver = struct {
+    context: ?*anyopaque = null,
+    observe_fn: *const fn (?*anyopaque, Authorization) anyerror!void,
+    begin_commit_fn: *const fn (?*anyopaque) anyerror!void = allow_commit,
+
+    fn observe(self: LoginObserver, authorization: Authorization) !void {
+        try self.observe_fn(self.context, authorization);
+    }
+
+    fn beginCommit(self: LoginObserver) !void {
+        try self.begin_commit_fn(self.context);
+    }
+};
+
+pub const LoginCancellation = struct {
+    context: ?*anyopaque = null,
+    is_cancelled_fn: *const fn (?*anyopaque) bool = never_cancelled,
+
+    fn is_cancelled(self: LoginCancellation) bool {
+        return self.is_cancelled_fn(self.context);
+    }
+};
+
+const LoginAdapter = struct {
+    observer: ?LoginObserver = null,
+    cancellation: LoginCancellation = .{},
+    write_stdout: bool = false,
+    browser_entropy: ?[48]u8 = null,
+
+    fn check_cancelled(self: LoginAdapter) !void {
+        if (self.cancellation.is_cancelled()) return error.LoginCancelled;
+    }
+
+    fn announce_authorization(self: LoginAdapter, authorization: Authorization) !void {
+        try self.check_cancelled();
+        if (self.observer) |observer| try observer.observe(authorization);
+        try self.check_cancelled();
+    }
+};
+
 pub fn runLogin(
     alloc: Allocator,
     transport: oauth_transport.Provider,
@@ -101,29 +146,82 @@ pub fn runLogin(
     provider: Provider,
     method: LoginMethod,
 ) !void {
+    try runLoginAdapted(alloc, transport, url_opener, provider, method, .{ .write_stdout = true });
+}
+
+/// Runs and persists a provider login without writing progress or completion to stdout.
+/// Authorization strings are borrowed and valid only for the duration of `observe_fn`.
+pub fn runLoginObserved(
+    alloc: Allocator,
+    transport: oauth_transport.Provider,
+    url_opener: host.UrlOpener,
+    provider: Provider,
+    method: LoginMethod,
+    observer: LoginObserver,
+    cancellation: LoginCancellation,
+) !void {
+    try runLoginAdapted(alloc, transport, url_opener, provider, method, .{
+        .observer = observer,
+        .cancellation = cancellation,
+    });
+}
+
+/// Runs an observed browser login with entropy prepared by the calling thread.
+/// This keeps secure-random I/O out of UI worker threads.
+pub fn runLoginObservedPrepared(
+    alloc: Allocator,
+    transport: oauth_transport.Provider,
+    url_opener: host.UrlOpener,
+    provider: Provider,
+    method: LoginMethod,
+    observer: LoginObserver,
+    cancellation: LoginCancellation,
+    browser_entropy: [48]u8,
+) !void {
+    try runLoginAdapted(alloc, transport, url_opener, provider, method, .{
+        .observer = observer,
+        .cancellation = cancellation,
+        .browser_entropy = browser_entropy,
+    });
+}
+
+fn runLoginAdapted(
+    alloc: Allocator,
+    transport: oauth_transport.Provider,
+    url_opener: host.UrlOpener,
+    provider: Provider,
+    method: LoginMethod,
+    adapter: LoginAdapter,
+) !void {
+    try adapter.check_cancelled();
     var session = switch (provider) {
         .anthropic => if (method != .device_code)
-            try loginBrowser(alloc, transport, url_opener, provider, method)
+            try loginBrowser(alloc, transport, url_opener, provider, method, adapter)
         else
             return error.ProviderLoginMethodUnsupported,
         .openai_codex => if (method == .device_code)
-            try loginCodexDevice(alloc, transport, url_opener)
+            try loginCodexDevice(alloc, transport, url_opener, adapter)
         else
-            try loginBrowser(alloc, transport, url_opener, provider, method),
+            try loginBrowser(alloc, transport, url_opener, provider, method, adapter),
         .xai => if (method != .manual_code)
-            try loginXaiDevice(alloc, transport, url_opener)
+            try loginXaiDevice(alloc, transport, url_opener, adapter)
         else
             return error.ProviderLoginMethodUnsupported,
     };
     defer session.deinit(alloc);
+    if (adapter.observer) |observer|
+        try observer.beginCommit()
+    else
+        try adapter.check_cancelled();
     try oauth_session.saveNamed(alloc, provider.fileName(), @tagName(provider), session);
-    try writeStdoutFmt("Signed in to {s}.\n", .{provider.label()});
+    if (adapter.write_stdout) try writeStdoutFmt("Signed in to {s}.\n", .{provider.label()});
 }
 
 fn loginCodexDevice(
     alloc: Allocator,
     transport: oauth_transport.Provider,
     url_opener: host.UrlOpener,
+    adapter: LoginAdapter,
 ) !oauth_session.Session {
     const provider = Provider.openai_codex;
     var request_body = std.Io.Writer.Allocating.init(alloc);
@@ -139,16 +237,19 @@ fn loginCodexDevice(
         request_body.writer.buffered(),
     );
     defer secret.zeroAndFree(alloc, bytes);
+    try adapter.check_cancelled();
     var device = try parseCodexDeviceAuthorization(alloc, bytes);
     defer device.deinit(alloc);
     const verification_uri = "https://auth.openai.com/codex/device";
-    try writeStdoutFmt("Open {s}\nCode: {s}\n\n", .{ verification_uri, device.user_code });
+    if (adapter.write_stdout) try writeStdoutFmt("Open {s}\nCode: {s}\n\n", .{ verification_uri, device.user_code });
+    try adapter.announce_authorization(.{ .url = verification_uri, .user_code = device.user_code });
     _ = try url_opener.open(alloc, verification_uri);
+    try adapter.check_cancelled();
 
     var interval = device.interval;
     const deadline = io_mod.milliTimestamp() +| 15 * std.time.ms_per_min;
     while (io_mod.milliTimestamp() < deadline) {
-        try sleepPollInterval(interval);
+        try sleepPollInterval(interval, adapter.cancellation);
         var poll_body = std.Io.Writer.Allocating.init(alloc);
         defer deinitSecretWriter(&poll_body);
         try poll_body.writer.writeAll("{\"device_auth_id\":");
@@ -162,9 +263,11 @@ fn loginCodexDevice(
             .payload = poll_body.writer.buffered(),
         });
         defer response.deinit(alloc);
+        try adapter.check_cancelled();
         if (response.disposition == .accepted) {
             var code = try parseCodexDeviceToken(alloc, response.body);
             defer code.deinit(alloc);
+            try adapter.check_cancelled();
             return exchangeCodexAuthorizationCode(
                 alloc,
                 transport,
@@ -183,6 +286,7 @@ fn loginCodexDevice(
         if (oauth_error == .access_denied) return error.AccessDenied;
         if (oauth_error == .expired_token) return error.ExpiredToken;
     }
+    try adapter.check_cancelled();
     return error.LoginTimedOut;
 }
 
@@ -259,6 +363,7 @@ fn loginBrowser(
     url_opener: host.UrlOpener,
     provider: Provider,
     method: LoginMethod,
+    adapter: LoginAdapter,
 ) !oauth_session.Session {
     if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.ProviderOAuthUnsupported;
     const port: u16 = if (provider == .anthropic) 53692 else 1455;
@@ -280,15 +385,20 @@ fn loginBrowser(
     defer if (listener) |*server| server.deinit(io_mod.getIo());
 
     var verifier_entropy: [32]u8 = undefined;
-    try io_mod.getIo().randomSecure(&verifier_entropy);
+    var state_entropy: [16]u8 = undefined;
+    if (adapter.browser_entropy) |entropy| {
+        @memcpy(&verifier_entropy, entropy[0..32]);
+        @memcpy(&state_entropy, entropy[32..48]);
+    } else {
+        try io_mod.getIo().randomSecure(&verifier_entropy);
+        try io_mod.getIo().randomSecure(&state_entropy);
+    }
     var verifier_buf: [43]u8 = undefined;
     const verifier = std.base64.url_safe_no_pad.Encoder.encode(&verifier_buf, &verifier_entropy);
     var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(verifier, &digest, .{});
     var challenge_buf: [43]u8 = undefined;
     const challenge = std.base64.url_safe_no_pad.Encoder.encode(&challenge_buf, &digest);
-    var state_entropy: [16]u8 = undefined;
-    try io_mod.getIo().randomSecure(&state_entropy);
     var state_buf: [22]u8 = undefined;
     const generated_state = std.base64.url_safe_no_pad.Encoder.encode(&state_buf, &state_entropy);
     const stable_state = if (provider == .anthropic) verifier else generated_state;
@@ -311,14 +421,17 @@ fn loginBrowser(
         try query.append(&url.writer, "originator", "fx");
     }
     const authorization_url = url.writer.buffered();
-    try writeStdoutFmt("Open this URL to sign in to {s}:\n{s}\n\n", .{ provider.label(), authorization_url });
+    if (adapter.write_stdout) try writeStdoutFmt("Open this URL to sign in to {s}:\n{s}\n\n", .{ provider.label(), authorization_url });
+    try adapter.announce_authorization(.{ .url = authorization_url });
     _ = try url_opener.open(alloc, authorization_url);
+    try adapter.check_cancelled();
 
     var callback = if (listener) |*server|
-        try waitForCallback(alloc, server, callback_path, stable_state)
+        try waitForCallback(alloc, server, callback_path, stable_state, adapter.cancellation)
     else
-        try readManualCallback(alloc, stable_state);
+        try readManualCallback(alloc, stable_state, adapter.write_stdout);
     defer callback.deinit(alloc);
+    try adapter.check_cancelled();
     if (!std.mem.eql(u8, callback.state, stable_state)) return error.OAuthStateMismatch;
 
     var body = std.Io.Writer.Allocating.init(alloc);
@@ -346,13 +459,14 @@ fn loginBrowser(
     }
     const bytes = try fetchAccepted(alloc, transport, token_method, provider.tokenUrl(), body.writer.buffered());
     defer secret.zeroAndFree(alloc, bytes);
+    try adapter.check_cancelled();
     var token = try parseToken(alloc, bytes, null, true, false);
     defer token.deinit(alloc);
     return takeSession(alloc, provider, &token);
 }
 
-fn readManualCallback(alloc: Allocator, expected_state: []const u8) !Callback {
-    try writeStdoutFmt("Paste the authorization code or final redirect URL, then press Enter:\n", .{});
+fn readManualCallback(alloc: Allocator, expected_state: []const u8, write_stdout: bool) !Callback {
+    if (write_stdout) try writeStdoutFmt("Paste the authorization code or final redirect URL, then press Enter:\n", .{});
     var read_buffer: [16 * 1024]u8 = undefined;
     var reader = std.Io.File.stdin().reader(io_mod.getIo(), &read_buffer);
     const line = try reader.interface.takeDelimiter('\n') orelse return error.EndOfStream;
@@ -468,6 +582,7 @@ fn loginXaiDevice(
     alloc: Allocator,
     transport: oauth_transport.Provider,
     url_opener: host.UrlOpener,
+    adapter: LoginAdapter,
 ) !oauth_session.Session {
     const provider = Provider.xai;
     var request_body = std.Io.Writer.Allocating.init(alloc);
@@ -484,16 +599,19 @@ fn loginXaiDevice(
         request_body.writer.buffered(),
     );
     defer secret.zeroAndFree(alloc, bytes);
+    try adapter.check_cancelled();
     var device = try parseXaiDeviceAuthorization(alloc, bytes);
     defer device.deinit(alloc);
     const display_url = device.verification_uri_complete orelse device.verification_uri;
-    try writeStdoutFmt("Open {s}\nCode: {s}\n\n", .{ display_url, device.user_code });
+    if (adapter.write_stdout) try writeStdoutFmt("Open {s}\nCode: {s}\n\n", .{ display_url, device.user_code });
+    try adapter.announce_authorization(.{ .url = display_url, .user_code = device.user_code });
     _ = try url_opener.open(alloc, display_url);
+    try adapter.check_cancelled();
 
     var interval: i64 = @max(device.interval, 1);
     const deadline = io_mod.milliTimestamp() +| device.expires_in *| std.time.ms_per_s;
     while (io_mod.milliTimestamp() < deadline) {
-        try sleepPollInterval(interval);
+        try sleepPollInterval(interval, adapter.cancellation);
         var poll_body = std.Io.Writer.Allocating.init(alloc);
         defer deinitSecretWriter(&poll_body);
         var poll_form: FormBody = .{};
@@ -506,6 +624,7 @@ fn loginXaiDevice(
             .payload = poll_body.writer.buffered(),
         });
         defer response.deinit(alloc);
+        try adapter.check_cancelled();
         if (response.disposition == .accepted) {
             var token = try parseToken(alloc, response.body, null, true, true);
             defer token.deinit(alloc);
@@ -521,6 +640,7 @@ fn loginXaiDevice(
         if (oauth_error == .expired_token) return error.ExpiredToken;
         return error.OAuthRequestFailed;
     }
+    try adapter.check_cancelled();
     return error.LoginTimedOut;
 }
 
@@ -540,9 +660,11 @@ fn waitForCallback(
     listener: *std.Io.net.Server,
     callback_path: []const u8,
     expected_state: []const u8,
+    cancellation: LoginCancellation,
 ) !Callback {
     var remaining = callback_timeout_ms;
     while (remaining > 0) {
+        if (cancellation.is_cancelled()) return error.LoginCancelled;
         var fds = [_]std.posix.pollfd{.{
             .fd = listener.socket.handle,
             .events = std.posix.POLL.IN,
@@ -552,6 +674,7 @@ fn waitForCallback(
         const ready = try std.posix.poll(&fds, wait_ms);
         remaining -= wait_ms;
         if (ready == 0) continue;
+        if (cancellation.is_cancelled()) return error.LoginCancelled;
 
         var stream = try listener.accept(io_mod.getIo());
         defer stream.close(io_mod.getIo());
@@ -575,9 +698,14 @@ fn waitForCallback(
             writeCallbackResponse(&stream, .bad_request) catch {};
             continue;
         }
+        if (cancellation.is_cancelled()) {
+            callback.deinit(alloc);
+            return error.LoginCancelled;
+        }
         try writeCallbackResponse(&stream, .ok);
         return callback;
     }
+    if (cancellation.is_cancelled()) return error.LoginCancelled;
     return error.LoginTimedOut;
 }
 
@@ -863,15 +991,27 @@ fn parsePollInterval(alloc: Allocator, bytes: []const u8) ?i64 {
     return value.integer;
 }
 
-fn sleepPollInterval(interval_seconds: i64) !void {
+fn sleepPollInterval(interval_seconds: i64, cancellation: LoginCancellation) !void {
     if (interval_seconds <= 0 or interval_seconds > max_poll_interval_seconds) return error.InvalidOAuthResponse;
-    const nanoseconds = std.math.mul(
+    var remaining_ms = std.math.mul(
         u64,
         @intCast(interval_seconds),
-        std.time.ns_per_s,
+        std.time.ms_per_s,
     ) catch return error.InvalidOAuthResponse;
-    io_mod.sleep(nanoseconds);
+    while (remaining_ms > 0) {
+        if (cancellation.is_cancelled()) return error.LoginCancelled;
+        const wait_ms = @min(remaining_ms, @as(u64, callback_poll_ms));
+        io_mod.sleep(wait_ms * @as(u64, std.time.ns_per_ms));
+        remaining_ms -= wait_ms;
+    }
+    if (cancellation.is_cancelled()) return error.LoginCancelled;
 }
+
+fn never_cancelled(_: ?*anyopaque) bool {
+    return false;
+}
+
+fn allow_commit(_: ?*anyopaque) !void {}
 
 fn deinitSecretWriter(writer: *std.Io.Writer.Allocating) void {
     @memset(@constCast(writer.writer.buffered()), 0);
@@ -1037,6 +1177,89 @@ test "Codex device responses accept string intervals and nested pending errors" 
         @as(i64, 17),
         parsePollInterval(std.testing.allocator, "{\"error\":\"slow_down\",\"interval\":17}").?,
     );
+}
+
+const ObservedLoginFixture = struct {
+    observed: bool = false,
+    opened: bool = false,
+    observer_ran_after_open: bool = false,
+    calls: usize = 0,
+
+    fn transport(self: *ObservedLoginFixture) oauth_transport.Provider {
+        return .{ .context = self, .execute_fn = execute };
+    }
+
+    fn execute(raw: ?*anyopaque, alloc: Allocator, request: oauth_transport.Request) !oauth_transport.Response {
+        const self: *ObservedLoginFixture = @ptrCast(@alignCast(raw.?));
+        self.calls += 1;
+        try std.testing.expectEqual(@as(usize, 1), self.calls);
+        try std.testing.expectEqualStrings("https://auth.x.ai/oauth2/device/code", request.url);
+        return .{
+            .disposition = .accepted,
+            .status = 200,
+            .body = try alloc.dupe(
+                u8,
+                "{\"device_code\":\"device\",\"user_code\":\"CODE\",\"verification_uri\":\"https://auth.x.ai/device\",\"expires_in\":600}",
+            ),
+        };
+    }
+
+    fn observe(raw: ?*anyopaque, authorization: Authorization) !void {
+        const self: *ObservedLoginFixture = @ptrCast(@alignCast(raw.?));
+        self.observer_ran_after_open = self.opened;
+        self.observed = true;
+        try std.testing.expectEqualStrings("https://auth.x.ai/device", authorization.url);
+        try std.testing.expectEqualStrings("CODE", authorization.user_code.?);
+    }
+
+    fn open(raw: ?*anyopaque, _: Allocator, _: []const u8) host.UrlOpenError!bool {
+        const self: *ObservedLoginFixture = @ptrCast(@alignCast(raw.?));
+        self.opened = true;
+        return true;
+    }
+
+    fn is_cancelled(raw: ?*anyopaque) bool {
+        const self: *ObservedLoginFixture = @ptrCast(@alignCast(raw.?));
+        return self.opened;
+    }
+};
+
+test "observed provider login reports authorization before opening and cancels promptly" {
+    var fixture: ObservedLoginFixture = .{};
+    try std.testing.expectError(
+        error.LoginCancelled,
+        runLoginObserved(
+            std.testing.allocator,
+            fixture.transport(),
+            .{ .context = &fixture, .open_fn = ObservedLoginFixture.open },
+            .xai,
+            .device_code,
+            .{ .context = &fixture, .observe_fn = ObservedLoginFixture.observe },
+            .{ .context = &fixture, .is_cancelled_fn = ObservedLoginFixture.is_cancelled },
+        ),
+    );
+    try std.testing.expect(fixture.observed);
+    try std.testing.expect(fixture.opened);
+    try std.testing.expect(!fixture.observer_ran_after_open);
+    try std.testing.expectEqual(@as(usize, 1), fixture.calls);
+}
+
+fn always_cancelled(_: ?*anyopaque) bool {
+    return true;
+}
+
+test "browser callback and device poll waits honor cancellation" {
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+    const cancellation = LoginCancellation{ .is_cancelled_fn = always_cancelled };
+    var address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var listener = try address.listen(std.testing.io, .{ .reuse_address = true });
+    defer listener.deinit(std.testing.io);
+
+    try std.testing.expectError(
+        error.LoginCancelled,
+        waitForCallback(std.testing.allocator, &listener, "/callback", "state", cancellation),
+    );
+    try std.testing.expectError(error.LoginCancelled, sleepPollInterval(5, cancellation));
 }
 
 test "managed access token validation rejects provider mismatches" {
