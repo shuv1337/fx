@@ -38,7 +38,7 @@ pub const native = Profile{
     .file_index = true,
     .mcp = true,
     .subagents = true,
-    .auto_upgrade = true,
+    .auto_upgrade = false,
     .skills = true,
     .clipboard = true,
     .url_opening = true,
@@ -101,6 +101,10 @@ test "native and wasm profiles select distinct auth host effects" {
     try std.testing.expect(!wasm.url_opening);
     try std.testing.expect(wasm.js_host_auth);
     try std.testing.expect(wasm.js_host_url_open);
+}
+
+test "native profile disables automatic upgrades" {
+    try std.testing.expect(!native.auto_upgrade);
 }
 
 test "workspace host capability is wasm only without enabling native tools" {
