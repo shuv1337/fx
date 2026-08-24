@@ -137,7 +137,7 @@ test "interrupted execution memory retains marked feedback through mixed user ta
         .{ .role = .tool, .content = "first command completed", .tool_call_id = calls[0].id, .tool_name = calls[0].name, .tool_result_status = .success },
         .{ .role = .tool, .content = "second command completed", .tool_call_id = calls[1].id, .tool_name = calls[1].name, .tool_result_status = .success },
         .{ .role = .user, .content = "first command feedback marker", .tool_call_id = calls[0].id, .permission_feedback = true },
-        .{ .role = .user, .content = "sandbox hint", .permission_feedback = false },
+        .{ .role = .user, .content = "custom hint", .permission_feedback = false },
         .{ .role = .user, .content = "second command feedback marker", .tool_call_id = calls[1].id, .permission_feedback = true },
     };
 
@@ -521,7 +521,6 @@ test "exact command sources delete replay and missing handles retain it" {
             .system_prompt = "",
             .gateway_retry_count = 0,
             .gateway_chat_url = "",
-            .gateway_tools_json = "[]",
             .agent_step_limit = 1,
             .cancel_flag = &cancel_flag,
             .session_child_capability = &capability,
@@ -675,7 +674,6 @@ test "common execution memory does not mark stored read previews as full" {
             .system_prompt = "",
             .gateway_retry_count = 0,
             .gateway_chat_url = "",
-            .gateway_tools_json = "[]",
             .agent_step_limit = 1,
             .cancel_flag = &cancel_flag,
             .tool_result_dir = result_dir,
@@ -786,7 +784,6 @@ test "large result storage redacts secret-bearing output before preview and disk
         .system_prompt = "",
         .gateway_retry_count = 0,
         .gateway_chat_url = "",
-        .gateway_tools_json = "[]",
         .agent_step_limit = 1,
         .cancel_flag = &cancel_flag,
         .tool_result_dir = dir,

@@ -41,7 +41,7 @@ import {
 } from "./tmux-helpers";
 
 const MODEL = "openai/gpt-5.5";
-const DEFAULT_MODEL = "zai/glm-5.2";
+const DEFAULT_MODEL = "moonshotai/kimi-k3";
 const DELAY_MS = 32_500;
 const MALFORMED_ARGUMENTS = '{"depth":1,"depth":2}';
 const MALFORMED_CALL_ID = "malformed_ask_1";
@@ -141,7 +141,7 @@ function sse(body: string): Response {
 
 function startGateway(
   response: () => Response,
-  classifierDecision: "allow" | "ask" = "allow",
+  classifierDecision: "clear" | "caution" = "clear",
 ): GatewayFixture {
   return startDynamicFakeGateway(response, {
     classifierDecision,
@@ -703,7 +703,7 @@ describe("gateway stream lifecycle", () => {
     })).toEqual([]);
   });
 
-  test("ask sends status text normally with the full tool surface", async () => {
+  test("no-save ask sends status text with the exec-only terminal surface", async () => {
     const root = createFixtureRoot("status-text-ask");
     const tracePath = join(root.root, "trace.log");
     const gateway = startGateway(() => fakeGatewayFinalText("STATUS_TEXT_ASK_COMPLETE"));
@@ -738,8 +738,8 @@ describe("gateway stream lifecycle", () => {
       expect(request.prompt[0]?.role).toBe("system");
       expect(request.prompt[1]?.role).toBe("system");
       expect(contentText(request.prompt[1]?.content)).toBe(WEB_SEARCH_GUIDANCE);
-      expect(toolByName(oracleRequest, "terminal")?.description).toContain(
-        "Use exec for a foreground command",
+      expect(toolByName(oracleRequest, "terminal")?.description).toBe(
+        "Run one captured command and return its result.",
       );
       expect(toolByName(oracleRequest, "skill")?.description).toContain(
         "the task clearly matches one",
@@ -806,7 +806,56 @@ describe("gateway stream lifecycle", () => {
     }
   }, 30_000);
 
-  test("ask keeps the GLM default model identity without enabling fast mode", async () => {
+  test("memory save rejects a corrupt store without replacing it", async () => {
+    const root = createFixtureRoot("memory-corrupt-save");
+    const tracePath = join(root.root, "trace.log");
+    const memoriesPath = join(root.home, ".fx", "memories.json");
+    const corruptStore = '["recoverable prior memory",\n';
+    writeFileSync(memoriesPath, corruptStore);
+
+    const callId = "memory_corrupt_save_1";
+    const responses = [
+      fakeGatewayToolCall(callId, "memory", {
+        action: "save",
+        fact: "replacement memory",
+      }),
+      fakeGatewayFinalText("Corrupt memory store handled."),
+    ];
+    const gateway = startGateway(() =>
+      responses.shift() ?? new Response("unexpected request", { status: 500 })
+    );
+
+    try {
+      const result = await runFx(
+        ["ask", "--auto", "--json", "--no-save", "Save a memory."],
+        {
+          cwd: root.workspace,
+          env: fixtureEnv(root, gateway, tracePath),
+          timeoutMs: 15_000,
+        },
+      );
+      const json = parseAskJson(result.stdout);
+
+      expect(result.code).toBe(0);
+      expect(json.exit_code).toBe(0);
+      expect(json.error).toBeUndefined();
+      expect(json.output).toContain("Corrupt memory store handled.");
+      expect(json.tool_calls).toContainEqual({
+        name: "memory",
+        status: "error",
+      });
+      expect(gateway.requestCount()).toBe(2);
+      expect(toolResultOutput(gateway.requests[1]!.body, callId)).toContain(
+        "memory store is malformed; ~/.fx/memories.json was not modified",
+      );
+      expect(readFileSync(memoriesPath, "utf8")).toBe(corruptStore);
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("ask keeps Kimi K3 as the default model with fast mode enabled", async () => {
     const root = createFixtureRoot("default-model");
     const tracePath = join(root.root, "trace.log");
     const gateway = startDynamicFakeGateway(
@@ -846,7 +895,9 @@ describe("gateway stream lifecycle", () => {
       );
       const request = JSON.parse(gateway.requests[0]!.body);
       expect(request).not.toHaveProperty("fast");
-      expect(request).not.toHaveProperty("providerOptions.gateway.speed");
+      expect(request).toMatchObject({
+        providerOptions: { gateway: { speed: "fast" } },
+      });
     } finally {
       gateway.stop();
       rmSync(root.root, { recursive: true, force: true });
@@ -2048,6 +2099,80 @@ describe("gateway stream lifecycle", () => {
     }
   });
 
+  test("default ask stops a consecutive malformed argument loop", async () => {
+    const root = createFixtureRoot("repeated-malformed-arguments");
+    const tracePath = join(root.root, "trace.log");
+    const alternateMalformedArguments = '{"path":"README.md",}';
+    const responses = [
+      fakeGatewaySerializedToolCall(
+        "malformed_repeat_1",
+        MALFORMED_TOOL_NAME,
+        MALFORMED_ARGUMENTS,
+      ),
+      fakeGatewaySerializedToolCall(
+        "malformed_repeat_2",
+        MALFORMED_TOOL_NAME,
+        MALFORMED_ARGUMENTS,
+      ),
+      fakeGatewaySerializedToolCall(
+        "malformed_repeat_3",
+        "read_file",
+        alternateMalformedArguments,
+      ),
+    ];
+    const gateway = startGateway(() =>
+      responses.shift() ?? new Response("unexpected request", { status: 500 })
+    );
+    try {
+      const result = await runFx(
+        [
+          "ask",
+          "--json",
+          "--auto",
+          "--no-save",
+          "Run the repeated malformed argument fixture.",
+        ],
+        {
+          cwd: root.workspace,
+          env: {
+            ...fixtureEnv(root, gateway, tracePath),
+            FX_MAX_AGENT_STEPS: undefined,
+          },
+          timeoutMs: 15_000,
+        },
+      );
+      const json = parseAskJson(result.stdout);
+      const trace = readFileSync(tracePath, "utf8");
+      const notice =
+        "Repeated malformed tool arguments stopped the agent loop. The invalid calls were not executed. Continue with a follow-up prompt if needed.";
+
+      expect(result.code).toBe(1);
+      expect(json.exit_code).toBe(1);
+      expect(json.error).toBeUndefined();
+      expect(result.stderr).toContain(notice);
+      expect(gateway.requestCount()).toBe(3);
+      expect(
+        json.tool_calls.filter(
+          (call) => call.name === MALFORMED_TOOL_NAME && call.status === "error",
+        ),
+      ).toHaveLength(2);
+      expect(json.tool_calls).toContainEqual({
+        name: "read_file",
+        status: "error",
+      });
+      expect(result.stdout).not.toContain(MALFORMED_ARGUMENTS);
+      expect(result.stderr).not.toContain(MALFORMED_ARGUMENTS);
+      expect(trace).toContain("event=repeated_malformed_tool_arguments");
+      expect(trace).not.toContain(MALFORMED_ARGUMENTS);
+      expect(result.stdout).not.toContain(alternateMalformedArguments);
+      expect(result.stderr).not.toContain(alternateMalformedArguments);
+      expect(trace).not.toContain(alternateMalformedArguments);
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  });
+
   test("text and JSON ask defer a newly scoped build target until rules are visible", async () => {
     const variants = [
       { name: "text", json: false },
@@ -2359,7 +2484,7 @@ describe("gateway stream lifecycle", () => {
       expect(output).toContain("AccessDenied");
       expect(output).toContain("Do not retry");
       expect(output).toContain("symlink");
-      expect(output).toContain("/sandbox none");
+      expect(output).toContain("fx permissions");
     } finally {
       gateway.stop();
       chmodSync(blockedPath, 0o700);
@@ -2565,7 +2690,7 @@ describe("gateway stream lifecycle", () => {
       );
       expect(historicalCalls).toHaveLength(1);
       expect(historicalCalls[0]).toEqual(
-        expect.objectContaining({ input: {} }),
+        expect.objectContaining({ input: { request: {} } }),
       );
       expect(historicalResults).toHaveLength(1);
       expect(gateway.requests[2].body).toContain("tool_execution_failed");
@@ -3510,7 +3635,7 @@ describe("gateway stream lifecycle", () => {
       requestIndex += 1;
       return responses.shift() ?? new Response("unexpected request", { status: 500 });
     }, {
-      classifierDecision: "allow",
+      classifierDecision: "clear",
       models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
     });
     try {
@@ -3668,7 +3793,7 @@ describe("gateway stream lifecycle", () => {
         },
       });
     }, {
-      classifierDecision: "allow",
+      classifierDecision: "clear",
       models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
     });
     try {
@@ -3760,7 +3885,7 @@ describe("gateway stream lifecycle", () => {
         },
       });
     }, {
-      classifierDecision: "allow",
+      classifierDecision: "clear",
       models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
     });
     try {
@@ -4166,7 +4291,7 @@ describe("gateway stream lifecycle", () => {
       }
       return new Response("unexpected matrix request", { status: 500 });
     }, {
-      classifierDecision: "allow",
+      classifierDecision: "clear",
       models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
     });
 
@@ -4267,8 +4392,8 @@ describe("gateway stream lifecycle", () => {
     }
   }, 90_000);
 
-  test("selected dynamic MCP automatic review asks with zero sends and allows exactly once", async () => {
-    for (const decision of ["ask", "allow"] as const) {
+  test("selected dynamic MCP review cautions with zero sends and clears exactly once", async () => {
+    for (const decision of ["caution", "clear"] as const) {
       const root = createFixtureRoot(`mcp-review-${decision}`);
       const tracePath = join(root.root, "trace.log");
       const mcp = writeMcpFixture(root);
@@ -4308,29 +4433,29 @@ describe("gateway stream lifecycle", () => {
         expect(gateway.classifierRequests[0]!.body).toContain(DYNAMIC_MCP_TOOL_NAME);
         expect(gateway.classifierRequests[0]!.body).toContain("exact-");
         expect(gateway.classifierRequests[0]!.body).toContain("inputSchema");
-        if (decision === "ask") {
-          // Headless automatic review returns a recoverable denial to the
+        if (decision === "caution") {
+          // Headless automatic review returns caution advice to the
           // primary model without executing the MCP tool or asking the user.
           expect(result.code).toBe(0);
           expect(gateway.requests).toHaveLength(3);
-          expect(gateway.requests[2]!.body).toContain("tool_permission_denied");
-          expect(gateway.requests[2]!.body).toContain("auto_denied");
+          expect(gateway.requests[2]!.body).toContain("tool_review_held");
+          expect(gateway.requests[2]!.body).toContain("review_caution");
           expect(gateway.requests[2]!.body).not.toContain("user_denied");
           const json = parseAskJson(result.stdout);
-          expect(json.output).toContain("MCP ask handled.");
+          expect(json.output).toContain("MCP caution handled.");
           expect(json.tool_calls).toContainEqual({
             name: DYNAMIC_MCP_TOOL_NAME,
             status: "error",
           });
           expect(result.stdout).not.toContain("NonInteractivePermissionRequired");
           expect(trace).toContain("event=auto_review_result");
-          expect(trace).toContain("decision=ask");
+          expect(trace).toContain("decision=caution");
           expect(trace).not.toContain("err=NonInteractivePermissionRequired");
           expect(existsSync(mcp.callLogPath)).toBe(false);
         } else {
           expect(result.code).toBe(0);
           const json = parseAskJson(result.stdout);
-          expect(trace).toContain("decision=allow");
+          expect(trace).toContain("decision=clear");
           expect(readFileSync(mcp.callLogPath, "utf8").trim().split("\n")).toHaveLength(1);
           expect(json.tool_calls).toContainEqual({
             name: DYNAMIC_MCP_TOOL_NAME,

@@ -27,56 +27,66 @@ curl -fsSL https://fx.sh/setup.sh | bash
 
 ## Run fx
 
-In interactive fx, run `/login` to choose Vercel, Anthropic Claude, OpenAI
-Codex, or xAI Grok. You can sign in with a provider account or subscription
-without configuring an API key first.
-
-From a shell, sign in with Vercel using:
+In interactive fx, run `/login` to choose an account provider. From a shell,
+sign in with Vercel AI Gateway using:
 
 ```bash
 fx login
 ```
 
-Or add an AI Gateway API key:
+Or use an eligible ChatGPT subscription through OpenAI Codex OAuth:
+
+```bash
+fx login codex
+fx
+```
+
+Or use an eligible Grok subscription through xAI OAuth:
+
+```bash
+fx login grok
+fx
+```
+
+`fx login codex` and `fx login grok` select that provider and a model from its authenticated catalog. Inside fx, open `/setup` and choose **Switch provider** to move between Gateway, Codex, and Grok. `/model` lists the active provider's fetched models. Subscription model IDs are the raw IDs returned by each authenticated catalog. Use `/logout codex` or `/logout grok` to remove that subscription session without affecting other providers; choosing it again from **Switch provider** starts sign-in.
+
+The OpenAI Codex route uses ChatGPT subscription access directly and never sends its OAuth token to Vercel AI Gateway. The session is stored privately at `~/.fx/chatgpt-auth.json` and refreshed when needed. On supported Codex models, `/fast` requests OpenAI's priority service tier and consumes ChatGPT credits at the higher Fast mode rate.
+
+The Grok route uses subscription access directly at xAI and never sends its OAuth token to Vercel AI Gateway or OpenAI. Its session is stored privately at `~/.fx/grok-auth.json`, refreshed when needed, and used only with the authenticated xAI catalog and Responses API.
+
+The native CLI and ACP server also retain fork-compatible direct routes with
+provider-qualified model IDs. Sign in once with fx:
+
+```bash
+fx login anthropic                 # Claude Pro or Max, browser OAuth
+fx login anthropic --manual-code   # Paste the redirect when using SSH
+fx login openai-codex --device-code
+fx login xai                       # SuperGrok or X Premium, device OAuth
+```
+
+Then select the matching direct route:
+
+```bash
+FX_MODEL=anthropic-max/claude-opus-4-8 fx
+FX_MODEL=openai-codex/gpt-5.5 fx
+FX_MODEL=xai-direct/grok-4.6 fx
+```
+
+Managed direct-route sessions take precedence over environment variables and
+external CLI credential files. Anthropic also accepts `ANTHROPIC_API_KEY` or an
+existing Claude Code login; Codex accepts `CODEX_ACCESS_TOKEN`; xAI accepts
+`XAI_API_KEY`. Remove these sessions with `fx logout anthropic`, `fx logout
+openai-codex`, or `fx logout xai`. Their credentials are scoped to the direct
+route and are never sent to Vercel AI Gateway. Existing IDs such as
+`anthropic/...` and `xai/...` continue to use AI Gateway. Direct routes support
+text and function tools; the Gateway-backed vision helper is not advertised on
+those routes.
+
+To use an AI Gateway API key instead:
 
 ```bash
 fx setup
 ```
-
-The native CLI and ACP server can also connect directly to subscription and
-vendor providers. Sign in once with fx:
-
-```bash
-fx login anthropic      # Claude Pro or Max, browser OAuth
-fx login anthropic --manual-code  # Paste the redirect when using SSH
-fx login openai-codex   # ChatGPT Plus or Pro, browser OAuth
-fx login openai-codex --device-code  # ChatGPT login on a headless machine
-fx login xai            # SuperGrok or X Premium, device OAuth
-```
-
-fx stores refreshable provider sessions in private files under `~/.fx/` and
-refreshes them before expiry or after an unauthorized response. Select a direct
-provider with a provider-qualified model ID:
-
-```bash
-# Use the fx-managed Anthropic login, an existing Claude Code login, or an API key.
-FX_MODEL=anthropic-max/claude-opus-4-8 fx
-
-# Use the fx-managed Codex login or an existing Codex CLI login.
-FX_MODEL=openai-codex/gpt-5.5 fx
-
-# Use the fx-managed xAI login or XAI_API_KEY.
-FX_MODEL=xai-direct/grok-4.6 fx
-```
-
-Managed sessions take precedence over environment variables and external CLI
-credential files. Anthropic API keys are accepted through `ANTHROPIC_API_KEY`;
-Codex accepts `CODEX_ACCESS_TOKEN`; xAI accepts `XAI_API_KEY`. Remove a managed
-session with `fx logout anthropic`, `fx logout openai-codex`, or `fx logout xai`.
-Direct-provider credentials are scoped to their route and are never sent to
-Vercel AI Gateway. Existing IDs such as `anthropic/...` and `xai/...` continue
-to use AI Gateway. Direct routes currently support text and function tools; the
-Gateway-backed vision helper is not advertised on those routes.
 
 Run fx from a project:
 
@@ -86,6 +96,16 @@ fx
 ```
 
 The current directory becomes the primary workspace. Enter a prompt, or run `/help` to browse interactive commands.
+
+The status line hides the workspace path and Git branch by default. Enable the `Status line workspace` option in `/settings`, run `/statusline workspace`, or set it in `~/.fx/settings.json`:
+
+```json
+{
+  "statusLine": {
+    "workspace": true
+  }
+}
+```
 
 List saved sessions with `fx sessions`. Resume the latest session for the current workspace, or select an exact session ID, through the same command group:
 
@@ -106,9 +126,9 @@ Use `fx ask` for a single request:
 fx ask "explain the changes in this repository"
 ```
 
-fx starts in `auto` permission mode. Routine understood development actions run directly; unresolved sensitive actions receive one bounded automatic review. A blocked action may return an exact approval request that the agent can send to fx's real permission screen. Ordinary question text never grants permission. See [Permissions](https://fx.sh/docs/configure-fx/permissions) for other modes and persistent rules.
+fx starts in `auto` permission mode. Routine understood development actions run directly. Each unresolved action receives one narrow safety review based on the current user request and the exact pending action. A clear result authorizes only that action. A caution or unavailable review holds the action and returns advice to the agent without opening a permission prompt or ending the turn. See [Permissions](https://fx.sh/docs/configure-fx/permissions) for other modes and persistent rules.
 
-JSON and quiet requests stay noninteractive by default. Add `--prompt-permissions` to allow the existing Y/N approval prompt when stdin is a TTY. Prompt text is written to stderr, so JSON stdout stays parseable and quiet stdout stays empty. Piped or redirected stdin remains noninteractive and fails instead of waiting for approval.
+JSON and quiet requests stay noninteractive by default. Add `--prompt-permissions` to allow configured approval prompts when stdin is a TTY. Automatic safety review never opens that prompt. Prompt text is written to stderr, so JSON stdout stays parseable and quiet stdout stays empty. Piped or redirected stdin remains noninteractive and fails instead of waiting for approval.
 
 Inside a saved session, `/permissions remember <allow|deny> <tool-name> <arguments-json>` stores an exact confirmed rule without running the action. `/permissions` lists stable rule IDs, and `/permissions revoke <rule-id>` removes a stored rule even when its original workspace or file state has changed.
 
@@ -126,7 +146,7 @@ The WebAssembly SDK is experimental. See the [WebAssembly SDK](sdk/README.md) an
 
 ## Extend fx
 
-Add reusable instructions with [skills](https://fx.sh/docs/capabilities/skills), connect external tools through [MCP](https://fx.sh/docs/capabilities/mcp), or delegate independent work to [subagents](https://fx.sh/docs/capabilities/subagents). Project instruction files may link within their scope, and read-only workspace or compatibility skill directories may link within their owning workspace or home; managed skills, `SKILL.md` files, resources, and escaping links remain no-follow. `fx status` and `fx doctor` report an invalid trusted MCP profile without starting its servers.
+Add reusable instructions with [skills](https://fx.sh/docs/capabilities/skills), connect external tools through [MCP](https://fx.sh/docs/capabilities/mcp), or delegate independent work to [subagents](https://fx.sh/docs/capabilities/subagents). Project instruction files may link within their scope, and read-only workspace or compatibility skill directories and their primary `SKILL.md` files may link within their owning workspace or home; managed skills, secondary resources, and escaping links remain no-follow. Skills installed via symlinks that resolve outside home or workspace (e.g. Nix store paths) are loaded when their resolved target is inside a directory listed in the `FX_SKILL_SYMLINK_AUTHORITIES` environment variable (colon-separated absolute paths). `fx status` and `fx doctor` report an invalid trusted MCP profile without starting its servers.
 
 ## Documentation
 

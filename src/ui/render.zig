@@ -1,4 +1,5 @@
 const std = @import("std");
+const build_options = @import("build_options");
 const io_mod = @import("../core/shared/io.zig");
 const host = @import("../core/hosts/host.zig");
 const display_width = @import("../core/shared/display_width.zig");
@@ -10,6 +11,7 @@ const main = @import("../main.zig");
 const theme_detection = @import("terminal/theme_detection.zig");
 const theme_protocol = @import("terminal/theme_protocol.zig");
 const visual_layout = @import("input/visual_layout.zig");
+const update_target = @import("../core/upgrade/update_target.zig");
 
 pub const input_prefix = "❯ ";
 pub const TerminalRgb = user_message_card.Rgb;
@@ -24,7 +26,6 @@ const user_message_card = @import("assistant/user_message_card.zig");
 pub const welcome_message_reserved_rows: u16 = 11;
 
 pub var is_light: bool = false;
-pub var input_bar_style: []const u8 = "";
 pub var divider_style: []const u8 = "\x1b[38;5;240m";
 pub var hint_style: []const u8 = "\x1b[38;5;255m";
 pub var statusline_style: []const u8 = "\x1b[38;5;245m";
@@ -66,7 +67,6 @@ pub fn initTheme(light: bool, terminal_bg: ?TerminalRgb) void {
     active_terminal_background = terminal_bg;
     assistant_presentation.setInlineCodeTheme(light);
     if (light) {
-        input_bar_style = "";
         divider_style = "\x1b[38;5;250m";
         hint_style = "\x1b[38;5;235m";
         statusline_style = "\x1b[38;5;241m";
@@ -85,7 +85,6 @@ pub fn initTheme(light: bool, terminal_bg: ?TerminalRgb) void {
         selected_completion_style = "\x1b[1;38;5;235m";
         permission_auto_style = "\x1b[38;5;238m";
     } else {
-        input_bar_style = "";
         divider_style = "\x1b[38;5;240m";
         hint_style = "\x1b[38;5;255m";
         statusline_style = "\x1b[38;5;245m";
@@ -115,11 +114,7 @@ pub fn initTheme(light: bool, terminal_bg: ?TerminalRgb) void {
         diff_removed_marker_style = diff_removed_marker_fallback;
     }
 
-    // Delegate bar shade computation to the card module — it owns the logic
-    // that derives a subtle but visible shade from the terminal's actual bg.
-    user_message_card.setTruecolor(truecolor_enabled);
     user_message_card.setStyle(light, terminal_bg);
-    input_bar_style = user_message_card.user_message_style;
 }
 
 pub fn themeNeedsUpdate(light: bool, terminal_bg: ?TerminalRgb) bool {
@@ -170,18 +165,48 @@ pub fn buildInputLineForRow(input: []const u8, cursor: usize, line_index: usize,
     };
 }
 
+const build_channel = update_target.Channel.parse(build_options.update_channel) orelse .stable;
+const welcome_build_label_bytes: usize = 96;
+const dev_revision_bytes: usize = 7;
+
+/// Dev builds ship on every merged PR, so the version alone cannot identify the
+/// binary: the header carries the commit and a brighter `[dev]` tag.
+fn writeBuildLabel(
+    out: []u8,
+    channel: update_target.Channel,
+    version_text: []const u8,
+    revision: []const u8,
+) ![]const u8 {
+    if (channel != .dev) return std.fmt.bufPrint(out, "v{s}", .{version_text});
+    if (revision.len < dev_revision_bytes or std.mem.eql(u8, revision, "unknown")) {
+        return std.fmt.bufPrint(out, "v{s} {s}[dev]{s}", .{ version_text, hint_style, dim_style });
+    }
+    return std.fmt.bufPrint(out, "v{s}-{s} {s}[dev]{s}", .{
+        version_text,
+        revision[0..dev_revision_bytes],
+        hint_style,
+        dim_style,
+    });
+}
+
 pub fn welcomeMessage(alloc: std.mem.Allocator) ![]u8 {
+    var label_buf: [welcome_build_label_bytes]u8 = undefined;
+    const build_label = try writeBuildLabel(
+        &label_buf,
+        build_channel,
+        main.version,
+        build_options.git_commit,
+    );
     return std.fmt.allocPrint(
         alloc,
-        "{s}𝒇x{s}{s} v{s} · Run /help for commands" ++ reset_style ++ "\n\n",
-        .{ subtitle_style, reset_style, dim_style, main.version },
+        "{s}𝒇x{s}{s} {s} · Run /help for commands" ++ reset_style ++ "\n\n",
+        .{ subtitle_style, reset_style, dim_style, build_label },
     );
 }
 
 pub const StatuslineItems = struct {
     workspace_label: []const u8 = "",
     git_branch: ?[]const u8 = null,
-    sandbox_label: ?[]const u8 = null,
     context_used: u64 = 0,
     context_total: ?u32 = null,
     session_title: ?[]const u8 = null,
@@ -411,11 +436,6 @@ pub fn buildHintLine(
 
     if (statusline.session_title) |title| {
         appendStatusSegment(out, &end, display_width.prefixByWidth(title, max_session_title_cells));
-    }
-
-    if (statusline.sandbox_label) |sb_label| {
-        var sandbox_buf: [64]u8 = undefined;
-        appendStatusSegment(out, &end, std.fmt.bufPrint(&sandbox_buf, "sandbox:{s}", .{sb_label}) catch "");
     }
 
     if (statusline.context_used > 0) {
@@ -791,12 +811,10 @@ test "initTheme sets light mode styles" {
     initTheme(true, null);
     try std.testing.expect(is_light);
     try std.testing.expect(!std.mem.eql(u8, subtitle_style, "\x1b[1;38;5;255m"));
-    try std.testing.expectEqualStrings("\x1b[48;5;255m\x1b[38;5;16m", input_bar_style);
 
     initTheme(false, null);
     try std.testing.expect(!is_light);
     try std.testing.expectEqualStrings("\x1b[1;38;5;255m", subtitle_style);
-    try std.testing.expectEqualStrings("\x1b[48;5;238m\x1b[38;5;250m", input_bar_style);
 }
 
 test "resume handoff uses one row only when the full instruction fits" {
@@ -871,14 +889,59 @@ test "welcomeMessage keeps only the app name bright" {
     const message = try welcomeMessage(std.testing.allocator);
     defer std.testing.allocator.free(message);
 
+    var label_buf: [welcome_build_label_bytes]u8 = undefined;
+    const build_label = try writeBuildLabel(
+        &label_buf,
+        build_channel,
+        main.version,
+        build_options.git_commit,
+    );
     const expected = try std.fmt.allocPrint(
         std.testing.allocator,
-        "{s}𝒇x{s}{s} v{s} · Run /help for commands" ++ reset_style ++ "\n\n",
-        .{ subtitle_style, reset_style, dim_style, main.version },
+        "{s}𝒇x{s}{s} {s} · Run /help for commands" ++ reset_style ++ "\n\n",
+        .{ subtitle_style, reset_style, dim_style, build_label },
     );
     defer std.testing.allocator.free(expected);
 
     try std.testing.expectEqualStrings(expected, message);
+}
+
+test "build label stays bare on the stable channel" {
+    var buf: [welcome_build_label_bytes]u8 = undefined;
+    const label = try writeBuildLabel(&buf, .stable, "0.0.4", "abcdef123456");
+    try std.testing.expectEqualStrings("v0.0.4", label);
+}
+
+test "dev build label carries the commit and restores the dim run after the tag" {
+    initTheme(false, null);
+
+    var buf: [welcome_build_label_bytes]u8 = undefined;
+    const label = try writeBuildLabel(&buf, .dev, "0.0.5", "abcdef123456");
+
+    const expected = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "v0.0.5-abcdef1 {s}[dev]{s}",
+        .{ hint_style, dim_style },
+    );
+    defer std.testing.allocator.free(expected);
+
+    try std.testing.expectEqualStrings(expected, label);
+}
+
+test "dev build label drops an unresolved revision" {
+    initTheme(false, null);
+
+    var buf: [welcome_build_label_bytes]u8 = undefined;
+    const label = try writeBuildLabel(&buf, .dev, "0.0.5", "unknown");
+
+    const expected = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "v0.0.5 {s}[dev]{s}",
+        .{ hint_style, dim_style },
+    );
+    defer std.testing.allocator.free(expected);
+
+    try std.testing.expectEqualStrings(expected, label);
 }
 
 test "buildHintLine hides effort when it is auto" {
@@ -918,14 +981,13 @@ test "buildHintLine shows full context usage" {
     try std.testing.expectEqualStrings("ask · opus 4.8 · Context: 43k/1000k 4%", line);
 }
 
-test "buildHintLine shows the session title before sandbox and context" {
+test "buildHintLine shows the session title" {
     var buf: [256]u8 = undefined;
     const line = buildHintLine(false, false, true, "openai/gpt-5", .ask, 0, null, false, false, .auto, false, .{
         .session_title = "add a session name display",
-        .sandbox_label = "none",
     }, 200, &buf);
     try std.testing.expectEqualStrings(
-        "ask · gpt-5 · add a session name display · sandbox:none",
+        "ask · gpt-5 · add a session name display",
         line,
     );
 }
@@ -1013,13 +1075,12 @@ test "buildHintLine labels detached HEAD" {
 test "buildHintLine keeps system labels and dot separators" {
     var buf: [256]u8 = undefined;
     const line = buildHintLine(false, false, false, "anthropic/claude-opus-4.8", .auto, 2, null, true, true, types.ReasoningEffort.literal("low"), true, .{
-        .sandbox_label = "none",
         .context_used = 43_000,
         .context_total = 1_000_000,
     }, 256, &buf);
     const expected = try std.fmt.allocPrint(
         std.testing.allocator,
-        "run /login · queued 2 · {s}auto{s} · opus 4.8 · low · ⚡︎ · sandbox:none · Context: 43k/1000k 4%",
+        "run /login · queued 2 · {s}auto{s} · opus 4.8 · low · ⚡︎ · Context: 43k/1000k 4%",
         .{ permission_auto_style, statusline_style },
     );
     defer std.testing.allocator.free(expected);

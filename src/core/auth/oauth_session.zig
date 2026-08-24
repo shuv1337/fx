@@ -1,6 +1,8 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const debug_trace = @import("../shared/debug_trace.zig");
 const host_target = @import("../hosts/target.zig");
+const native_keychain = @import("../hosts/native_keychain.zig");
 const io_mod = @import("../shared/io.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
 const js_host_auth = @import("js_host_auth.zig");
@@ -20,6 +22,82 @@ const mutation_lock_file_name = "auth.lock";
 const mutation_lock_deadline_ms: u64 = 2000;
 const e2e_lock_contention_file_name = "auth-lock-contention";
 const LoadMode = enum { tolerate_open_failure, report_open_failure };
+
+const StorageBackend = enum {
+    profile_file,
+    macos_keychain,
+};
+
+const FileState = enum { absent, valid, unusable };
+const KeychainState = enum { absent, valid, invalid, unavailable };
+const Resolution = enum {
+    missing,
+    file_migrate,
+    file_defer_migration,
+    keychain,
+    storage_error,
+};
+
+const Authority = enum { unresolved, missing, profile_file, keychain };
+
+const KeychainError = Allocator.Error || native_keychain.Error;
+
+const KeychainBackend = struct {
+    context: ?*anyopaque = null,
+    load_fn: *const fn (?*anyopaque, Allocator) KeychainError!?[]u8,
+    store_fn: *const fn (?*anyopaque, []const u8) KeychainError!void,
+    delete_fn: *const fn (?*anyopaque, Allocator) KeychainError!bool,
+
+    fn load(self: KeychainBackend, alloc: Allocator) KeychainError!?[]u8 {
+        return self.load_fn(self.context, alloc);
+    }
+
+    fn store(self: KeychainBackend, value: []const u8) KeychainError!void {
+        return self.store_fn(self.context, value);
+    }
+
+    fn delete(self: KeychainBackend, alloc: Allocator) KeychainError!bool {
+        return self.delete_fn(self.context, alloc);
+    }
+};
+
+const native_keychain_backend: KeychainBackend = .{
+    .load_fn = nativeKeychainLoad,
+    .store_fn = nativeKeychainStore,
+    .delete_fn = nativeKeychainDelete,
+};
+
+fn nativeKeychainLoad(_: ?*anyopaque, alloc: Allocator) KeychainError!?[]u8 {
+    return native_keychain.loadOAuthSession(alloc);
+}
+
+fn nativeKeychainStore(_: ?*anyopaque, value: []const u8) KeychainError!void {
+    return native_keychain.storeOAuthSession(value);
+}
+
+fn nativeKeychainDelete(_: ?*anyopaque, alloc: Allocator) KeychainError!bool {
+    return native_keychain.deleteOAuthSession(alloc);
+}
+
+fn selectStorageBackend(os_tag: std.Target.Os.Tag, keychain_disabled: bool) StorageBackend {
+    if (os_tag == .macos and !keychain_disabled) return .macos_keychain;
+    return .profile_file;
+}
+
+fn storageBackend() StorageBackend {
+    return selectStorageBackend(builtin.os.tag, native_keychain.isDisabled());
+}
+
+fn selectResolution(file: FileState, keychain: KeychainState) Resolution {
+    return switch (file) {
+        .valid => if (keychain == .unavailable) .file_defer_migration else .file_migrate,
+        .absent, .unusable => switch (keychain) {
+            .absent => .missing,
+            .valid => .keychain,
+            .invalid, .unavailable => .storage_error,
+        },
+    };
+}
 
 pub fn refresh_deadline_ms(expires_at_ms: i64) i64 {
     return expires_at_ms -| expiry_skew_ms;
@@ -57,6 +135,11 @@ pub const DeleteOutcome = enum {
     deleted_not_durable,
 };
 
+pub const DeleteResult = struct {
+    session_deleted: bool = false,
+    local_cleanup_failed: bool = false,
+};
+
 pub const Session = struct {
     issuer: []u8,
     client_id: []u8,
@@ -85,11 +168,169 @@ pub const Session = struct {
     }
 };
 
+const FileObservation = union(enum) {
+    absent,
+    valid: Session,
+    unusable,
+
+    fn state(self: FileObservation) FileState {
+        return switch (self) {
+            .absent => .absent,
+            .valid => .valid,
+            .unusable => .unusable,
+        };
+    }
+
+    fn takeSession(self: *FileObservation) ?Session {
+        return switch (self.*) {
+            .valid => |session| blk: {
+                self.* = .absent;
+                break :blk session;
+            },
+            else => null,
+        };
+    }
+
+    fn deinit(self: *FileObservation, alloc: Allocator) void {
+        switch (self.*) {
+            .valid => |*session| session.deinit(alloc),
+            else => {},
+        }
+        self.* = .absent;
+    }
+};
+
+const KeychainObservation = union(enum) {
+    absent,
+    valid: Session,
+    invalid,
+    unavailable: KeychainError,
+
+    fn state(self: KeychainObservation) KeychainState {
+        return switch (self) {
+            .absent => .absent,
+            .valid => .valid,
+            .invalid => .invalid,
+            .unavailable => .unavailable,
+        };
+    }
+
+    fn takeSession(self: *KeychainObservation) ?Session {
+        return switch (self.*) {
+            .valid => |session| blk: {
+                self.* = .absent;
+                break :blk session;
+            },
+            else => null,
+        };
+    }
+
+    fn storageError(self: KeychainObservation) (KeychainError || error{
+        InvalidOAuthKeychainSession,
+        InvalidOAuthStorageState,
+    }) {
+        return switch (self) {
+            .invalid => error.InvalidOAuthKeychainSession,
+            .unavailable => |err| err,
+            else => error.InvalidOAuthStorageState,
+        };
+    }
+
+    fn deinit(self: *KeychainObservation, alloc: Allocator) void {
+        switch (self.*) {
+            .valid => |*session| session.deinit(alloc),
+            else => {},
+        }
+        self.* = .absent;
+    }
+};
+
+fn observeAuthFile(alloc: Allocator, fx_dir: *std.Io.Dir) !FileObservation {
+    var file = fx_dir.openFile(io_mod.getIo(), auth_file_name, .{
+        .mode = .read_only,
+        .allow_directory = false,
+        .follow_symlinks = false,
+        .resolve_beneath = true,
+    }) catch |err| switch (err) {
+        error.FileNotFound => return .absent,
+        else => {
+            debug_trace.logf("auth", "session load failed source=file step=open err={s}", .{@errorName(err)});
+            return .unusable;
+        },
+    };
+    defer file.close(io_mod.getIo());
+
+    const stat = file.stat(io_mod.getIo()) catch |err| {
+        debug_trace.logf("auth", "session load failed source=file step=stat err={s}", .{@errorName(err)});
+        return .unusable;
+    };
+    if (stat.kind != .file or stat.nlink != 1 or stat.permissions.toMode() & 0o077 != 0) {
+        debug_trace.logf("auth", "session load failed source=file step=permissions err=InsecureAuthFile", .{});
+        return .unusable;
+    }
+
+    const bytes = io_mod.readFileToEnd(alloc, &file, max_auth_file_bytes) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => {
+            debug_trace.logf("auth", "session load failed source=file step=read err={s}", .{@errorName(err)});
+            return .unusable;
+        },
+    };
+    defer secret.zeroAndFree(alloc, bytes);
+    const session = parse(alloc, bytes) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => {
+            debug_trace.logf("auth", "session load failed source=file step=parse err={s}", .{@errorName(err)});
+            return .unusable;
+        },
+    };
+    return .{ .valid = session };
+}
+
+fn observeKeychain(alloc: Allocator, keychain: KeychainBackend) !KeychainObservation {
+    const maybe_bytes = keychain.load(alloc) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        error.KeychainItemNotFound => return .absent,
+        else => return .{ .unavailable = err },
+    };
+    const bytes = maybe_bytes orelse return .absent;
+    defer secret.zeroAndFree(alloc, bytes);
+    if (bytes.len > max_auth_file_bytes) return .invalid;
+    const session = parse(alloc, bytes) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return .invalid,
+    };
+    return .{ .valid = session };
+}
+
+fn publishAndVerifyKeychain(alloc: Allocator, keychain: KeychainBackend, session: Session) !void {
+    const bytes = try stringify(alloc, session);
+    defer secret.zeroAndFree(alloc, bytes);
+    try keychain.store(bytes);
+    const persisted = keychain.load(alloc) catch |err| switch (err) {
+        error.KeychainItemNotFound => return error.OAuthSessionKeychainWriteMismatch,
+        else => return err,
+    } orelse return error.OAuthSessionKeychainWriteMismatch;
+    defer secret.zeroAndFree(alloc, persisted);
+    if (!std.mem.eql(u8, bytes, persisted)) return error.OAuthSessionKeychainWriteMismatch;
+}
+
+fn authFileExists(fx_dir: *std.Io.Dir) !bool {
+    _ = fx_dir.statFile(io_mod.getIo(), auth_file_name, .{}) catch |err| switch (err) {
+        error.FileNotFound => return false,
+        else => return err,
+    };
+    return true;
+}
+
 pub const Mutation = if (host_target.is_wasm) HostMutation else NativeMutation;
 
 const NativeMutation = struct {
     fx_dir: io_mod.VerifiedDir,
     lock: io_mod.TimedAdvisoryLock,
+    backend: StorageBackend,
+    keychain: KeychainBackend,
+    authority: Authority = .unresolved,
     file_name: []const u8 = auth_file_name,
     expected_issuer: ?[]const u8 = null,
 
@@ -100,17 +341,129 @@ const NativeMutation = struct {
     }
 
     pub fn load(self: *Mutation, alloc: Allocator) !?Session {
-        return loadFromDir(alloc, &self.fx_dir.dir, self.file_name, self.expected_issuer, .report_open_failure);
+        if (self.backend == .profile_file) {
+            self.authority = .profile_file;
+            return loadNamedFromDir(alloc, &self.fx_dir.dir, self.file_name, self.expected_issuer, .report_open_failure);
+        }
+        return self.loadKeychainResolved(alloc);
     }
 
     pub fn save(self: *Mutation, alloc: Allocator, session: Session) !void {
+        if (self.backend == .macos_keychain) {
+            return self.saveKeychainResolved(alloc, session);
+        }
+        self.authority = .profile_file;
+        return self.saveFile(alloc, session);
+    }
+
+    fn saveFile(self: *Mutation, alloc: Allocator, session: Session) !void {
         const text = try stringify(alloc, session);
         defer secret.zeroAndFree(alloc, text);
         try io_mod.durableReplaceVerified(alloc, &self.fx_dir, self.file_name, text);
     }
 
-    pub fn delete(self: *Mutation) !DeleteOutcome {
+    pub fn delete(self: *Mutation, alloc: Allocator) !DeleteResult {
+        var result: DeleteResult = .{};
+        if (self.backend == .macos_keychain) {
+            const deleted = self.keychain.delete(alloc) catch blk: {
+                result.local_cleanup_failed = true;
+                break :blk false;
+            };
+            result.session_deleted = result.session_deleted or deleted;
+        }
+
+        const file_outcome = deleteSessionFile(&self.fx_dir.dir, self.file_name, .{}) catch {
+            result.local_cleanup_failed = true;
+            return result;
+        };
+        switch (file_outcome) {
+            .missing => {},
+            .deleted => result.session_deleted = true,
+            .deleted_not_durable => {
+                result.session_deleted = true;
+                result.local_cleanup_failed = true;
+            },
+        }
+        self.authority = .missing;
+        return result;
+    }
+
+    pub fn deleteNamed(self: *Mutation) !DeleteOutcome {
         return deleteSessionFile(&self.fx_dir.dir, self.file_name, .{});
+    }
+
+    fn loadKeychainResolved(self: *Mutation, alloc: Allocator) !?Session {
+        var file = try observeAuthFile(alloc, &self.fx_dir.dir);
+        defer file.deinit(alloc);
+        var keychain = try observeKeychain(alloc, self.keychain);
+        defer keychain.deinit(alloc);
+
+        switch (selectResolution(file.state(), keychain.state())) {
+            .missing => {
+                self.authority = .missing;
+                return null;
+            },
+            .keychain => {
+                self.authority = .keychain;
+                return keychain.takeSession().?;
+            },
+            .file_defer_migration => {
+                self.authority = .profile_file;
+                return file.takeSession().?;
+            },
+            .file_migrate => {
+                var session = file.takeSession().?;
+                errdefer session.deinit(alloc);
+                const migrated = try self.publishAndCleanup(alloc, session);
+                self.authority = if (migrated) .keychain else .profile_file;
+                return session;
+            },
+            .storage_error => return keychain.storageError(),
+        }
+    }
+
+    fn saveKeychainResolved(self: *Mutation, alloc: Allocator, session: Session) !void {
+        if (self.authority == .unresolved) {
+            self.authority = if (try authFileExists(&self.fx_dir.dir)) .profile_file else .keychain;
+        }
+
+        switch (self.authority) {
+            .profile_file => {
+                try self.saveFile(alloc, session);
+                const migrated = try self.publishAndCleanup(alloc, session);
+                if (migrated) self.authority = .keychain;
+            },
+            .keychain, .missing => {
+                try publishAndVerifyKeychain(alloc, self.keychain, session);
+                self.authority = .keychain;
+            },
+            .unresolved => unreachable,
+        }
+    }
+
+    fn publishAndCleanup(self: *Mutation, alloc: Allocator, session: Session) !bool {
+        publishAndVerifyKeychain(alloc, self.keychain, session) catch |err| {
+            debug_trace.logf("auth", "session migration deferred step=publish err={s}", .{@errorName(err)});
+            return false;
+        };
+
+        const outcome = deleteAuthFile(&self.fx_dir.dir, .{}) catch |err| {
+            const stat = self.fx_dir.dir.statFile(io_mod.getIo(), auth_file_name, .{}) catch |stat_err| switch (stat_err) {
+                error.FileNotFound => return error.OAuthSessionCleanupUncertain,
+                else => return stat_err,
+            };
+            if (stat.kind != .file) return error.OAuthSessionCleanupUncertain;
+            debug_trace.logf("auth", "session migration deferred step=delete err={s}", .{@errorName(err)});
+            return false;
+        };
+        return switch (outcome) {
+            .deleted => true,
+            .missing => blk: {
+                try io_mod.syncVerifiedDir(self.fx_dir.dir);
+                break :blk true;
+            },
+            .deleted_not_durable => error.OAuthSessionCleanupUncertain,
+        };
     }
 };
 
@@ -149,12 +502,16 @@ const HostMutation = struct {
         try self.captureStoredRevision(revision);
     }
 
-    pub fn delete(self: *HostMutation) !DeleteOutcome {
+    pub fn delete(self: *HostMutation, _: Allocator) !DeleteResult {
         const expected = if (self.exists) self.revision[0..self.revision_len] else null;
         return switch (try self.store.remove(expected)) {
-            .deleted => .deleted,
-            .missing => .missing,
+            .deleted => .{ .session_deleted = true },
+            .missing => .{},
         };
+    }
+
+    pub fn deleteNamed(_: *HostMutation) !DeleteOutcome {
+        return .missing;
     }
 
     fn captureRevision(self: *HostMutation, alloc: Allocator) !void {
@@ -228,6 +585,14 @@ pub fn load(alloc: Allocator) !?Session {
         debug_trace.logf("auth", "session load skipped step=home err=HomeNotSet", .{});
         return null;
     };
+    if (storageBackend() == .macos_keychain) {
+        if (try beginExistingNativeMutation()) |existing| {
+            var mutation = existing;
+            defer mutation.deinit();
+            return mutation.load(alloc);
+        }
+        return loadKeychainWithoutProfile(alloc);
+    }
     var home_dir = std.Io.Dir.openDirAbsolute(io_mod.getIo(), home, .{ .iterate = true }) catch |err| {
         debug_trace.logf("auth", "session load failed step=open_home err={s}", .{@errorName(err)});
         return null;
@@ -243,7 +608,7 @@ pub fn load(alloc: Allocator) !?Session {
     };
     defer fx_dir.close(io_mod.getIo());
 
-    return loadFromDir(alloc, &fx_dir, auth_file_name, null, .tolerate_open_failure);
+    return loadFromDir(alloc, &fx_dir, .tolerate_open_failure);
 }
 
 pub fn loadNamed(alloc: Allocator, file_name: []const u8, expected_issuer: []const u8) !?Session {
@@ -256,7 +621,7 @@ pub fn loadNamed(alloc: Allocator, file_name: []const u8, expected_issuer: []con
         .follow_symlinks = false,
     }) catch return null;
     defer fx_dir.close(io_mod.getIo());
-    return loadFromDir(alloc, &fx_dir, file_name, expected_issuer, .tolerate_open_failure);
+    return loadNamedFromDir(alloc, &fx_dir, file_name, expected_issuer, .tolerate_open_failure);
 }
 
 fn loadFromHost(alloc: Allocator, store: js_host_auth.SessionStore) !?Session {
@@ -271,7 +636,11 @@ fn loadFromHost(alloc: Allocator, store: js_host_auth.SessionStore) !?Session {
     };
 }
 
-fn loadFromDir(alloc: Allocator, fx_dir: *std.Io.Dir, file_name: []const u8, expected_issuer: ?[]const u8, mode: LoadMode) !?Session {
+fn loadFromDir(alloc: Allocator, fx_dir: *std.Io.Dir, mode: LoadMode) !?Session {
+    return loadNamedFromDir(alloc, fx_dir, auth_file_name, null, mode);
+}
+
+fn loadNamedFromDir(alloc: Allocator, fx_dir: *std.Io.Dir, file_name: []const u8, expected_issuer: ?[]const u8, mode: LoadMode) !?Session {
     var file = fx_dir.openFile(io_mod.getIo(), file_name, .{
         .mode = .read_only,
         .allow_directory = false,
@@ -324,13 +693,20 @@ pub fn saveNamed(alloc: Allocator, file_name: []const u8, expected_issuer: []con
 pub fn deleteNamed(file_name: []const u8, expected_issuer: []const u8) !DeleteOutcome {
     var mutation = (try beginNamedMutation(file_name, expected_issuer)) orelse return .missing;
     defer mutation.deinit();
-    return mutation.delete();
+    return mutation.deleteNamed();
 }
 
 pub fn beginExistingMutation() !?Mutation {
     if (comptime host_target.is_wasm) {
         return @as(?Mutation, HostMutation.init(js_host_auth.oauth_session_store));
     }
+    if (storageBackend() == .macos_keychain) {
+        return @as(?Mutation, try beginMutation());
+    }
+    return beginExistingNativeMutation();
+}
+
+fn beginExistingNativeMutation() !?Mutation {
     const home = io_mod.getenv("HOME") orelse return error.HomeNotSet;
     var home_dir = io_mod.VerifiedDir{
         .dir = try std.Io.Dir.openDirAbsolute(io_mod.getIo(), home, .{ .iterate = true }),
@@ -341,7 +717,7 @@ pub fn beginExistingMutation() !?Mutation {
         error.FileNotFound => return null,
         else => return err,
     };
-    return @as(?Mutation, try lockMutation(fx_dir, auth_file_name));
+    return @as(?Mutation, try lockMutation(fx_dir));
 }
 
 pub fn beginNamedMutation(file_name: []const u8, expected_issuer: []const u8) !?Mutation {
@@ -352,9 +728,34 @@ pub fn beginNamedMutation(file_name: []const u8, expected_issuer: []const u8) !?
     };
     defer home_dir.close();
     const fx_dir = try io_mod.openOrCreateVerifiedPrivateDir(&home_dir, profile_paths.root_dir_name);
-    var mutation = try lockMutation(fx_dir, file_name);
+    var mutation = try lockMutationWithBackend(
+        fx_dir,
+        mutation_lock_deadline_ms,
+        .{},
+        .profile_file,
+        native_keychain_backend,
+    );
+    mutation.file_name = file_name;
     mutation.expected_issuer = expected_issuer;
     return @as(?Mutation, mutation);
+}
+
+fn loadKeychainWithoutProfile(alloc: Allocator) !?Session {
+    var keychain = try observeKeychain(alloc, native_keychain_backend);
+    defer keychain.deinit(alloc);
+
+    if (try beginExistingNativeMutation()) |existing| {
+        var mutation = existing;
+        defer mutation.deinit();
+        return mutation.load(alloc);
+    }
+
+    return switch (selectResolution(.absent, keychain.state())) {
+        .missing => null,
+        .keychain => keychain.takeSession().?,
+        .storage_error => keychain.storageError(),
+        .file_migrate, .file_defer_migration => unreachable,
+    };
 }
 
 fn beginMutation() !Mutation {
@@ -365,23 +766,37 @@ fn beginMutation() !Mutation {
     defer home_dir.close();
 
     const fx_dir = try io_mod.openOrCreateVerifiedPrivateDir(&home_dir, profile_paths.root_dir_name);
-    return lockMutation(fx_dir, auth_file_name);
+    return lockMutation(fx_dir);
 }
 
-fn lockMutation(open_fx_dir: io_mod.VerifiedDir, file_name: []const u8) !Mutation {
+fn lockMutation(open_fx_dir: io_mod.VerifiedDir) !Mutation {
     var probe = MutationLockProbe{ .fx_dir = open_fx_dir.dir };
-    var mutation = try lockMutationWithOps(open_fx_dir, mutation_lock_deadline_ms, .{
+    return lockMutationWithOps(open_fx_dir, mutation_lock_deadline_ms, .{
         .ctx = &probe,
         .try_lock = MutationLockProbe.tryLock,
     });
-    mutation.file_name = file_name;
-    return mutation;
 }
 
 fn lockMutationWithOps(
     open_fx_dir: io_mod.VerifiedDir,
     deadline_ms: u64,
     ops: io_mod.LockOps,
+) !Mutation {
+    return lockMutationWithBackend(
+        open_fx_dir,
+        deadline_ms,
+        ops,
+        storageBackend(),
+        native_keychain_backend,
+    );
+}
+
+fn lockMutationWithBackend(
+    open_fx_dir: io_mod.VerifiedDir,
+    deadline_ms: u64,
+    ops: io_mod.LockOps,
+    backend: StorageBackend,
+    keychain: KeychainBackend,
 ) !Mutation {
     var fx_dir = open_fx_dir;
     errdefer fx_dir.close();
@@ -397,6 +812,8 @@ fn lockMutationWithOps(
     return .{
         .fx_dir = fx_dir,
         .lock = lock,
+        .backend = backend,
+        .keychain = keychain,
     };
 }
 
@@ -423,6 +840,10 @@ fn openExistingPrivateFxDir(home_dir: *io_mod.VerifiedDir) !io_mod.VerifiedDir {
     return .{ .dir = dir };
 }
 
+fn deleteAuthFile(fx_dir: *std.Io.Dir, ops: io_mod.DurableOps) !DeleteOutcome {
+    return deleteSessionFile(fx_dir, auth_file_name, ops);
+}
+
 fn deleteSessionFile(fx_dir: *std.Io.Dir, file_name: []const u8, ops: io_mod.DurableOps) !DeleteOutcome {
     fx_dir.deleteFile(io_mod.getIo(), file_name) catch |err| switch (err) {
         error.FileNotFound => return .missing,
@@ -436,18 +857,6 @@ pub fn parse(alloc: Allocator, bytes: []const u8) !Session {
     return parseExpectedIssuer(alloc, bytes, null);
 }
 
-test "named sessions require their exact provider issuer" {
-    const bytes =
-        "{\"version\":1,\"issuer\":\"xai\",\"client_id\":\"client\",\"access_token\":\"access\",\"refresh_token\":\"refresh\",\"expires_at_ms\":4102444800000,\"scope\":\"openid\",\"token_type\":\"Bearer\"}";
-    var session = try parseExpectedIssuer(std.testing.allocator, bytes, "xai");
-    defer session.deinit(std.testing.allocator);
-    try std.testing.expectEqualStrings("access", session.access_token);
-    try std.testing.expectError(
-        error.InvalidAuthSession,
-        parseExpectedIssuer(std.testing.allocator, bytes, "anthropic"),
-    );
-}
-
 fn parseExpectedIssuer(alloc: Allocator, bytes: []const u8, expected_issuer: ?[]const u8) !Session {
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, bytes, .{});
     defer parsed.deinit();
@@ -458,7 +867,9 @@ fn parseExpectedIssuer(alloc: Allocator, bytes: []const u8, expected_issuer: ?[]
     const saved_issuer = try requiredString(object, "issuer");
     if (expected_issuer) |expected| {
         if (!std.mem.eql(u8, saved_issuer, expected)) return error.InvalidAuthSession;
-    } else if (!std.mem.eql(u8, saved_issuer, issuer) and !isLoopbackE2EIssuer(saved_issuer)) return error.InvalidAuthSession;
+    } else if (!std.mem.eql(u8, saved_issuer, issuer) and !isLoopbackE2EIssuer(saved_issuer)) {
+        return error.InvalidAuthSession;
+    }
 
     const expires_at_ms = try requiredInteger(object, "expires_at_ms");
     const owned_issuer = try alloc.dupe(u8, saved_issuer);
@@ -489,6 +900,18 @@ fn parseExpectedIssuer(alloc: Allocator, bytes: []const u8, expected_issuer: ?[]
         .team_slug = team_slug,
         .team_id = team_id,
     };
+}
+
+test "named sessions require their exact provider issuer" {
+    const bytes =
+        "{\"version\":1,\"issuer\":\"xai\",\"client_id\":\"client\",\"access_token\":\"access\",\"refresh_token\":\"refresh\",\"expires_at_ms\":4102444800000,\"scope\":\"openid\",\"token_type\":\"Bearer\"}";
+    var session = try parseExpectedIssuer(std.testing.allocator, bytes, "xai");
+    defer session.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("access", session.access_token);
+    try std.testing.expectError(
+        error.InvalidAuthSession,
+        parseExpectedIssuer(std.testing.allocator, bytes, "anthropic"),
+    );
 }
 
 pub fn stringify(alloc: Allocator, session: Session) ![]u8 {
@@ -609,7 +1032,7 @@ fn check_parse_allocation_failures(alloc: Allocator) !void {
 }
 
 fn check_load_allocation_failures(alloc: Allocator, dir: *std.Io.Dir) !void {
-    var session = (try loadFromDir(alloc, dir, auth_file_name, null, .report_open_failure)) orelse return error.TestUnexpectedMissingSession;
+    var session = (try loadFromDir(alloc, dir, .report_open_failure)) orelse return error.TestUnexpectedMissingSession;
     defer session.deinit(alloc);
 }
 
@@ -638,6 +1061,250 @@ test "oauth session stringifies and parses" {
     try std.testing.expectEqualStrings("team_123", parsed.team_id.?);
 }
 
+test "OAuth storage backend selection is platform scoped and explicitly disableable" {
+    try std.testing.expectEqual(StorageBackend.macos_keychain, selectStorageBackend(.macos, false));
+    try std.testing.expectEqual(StorageBackend.profile_file, selectStorageBackend(.macos, true));
+    try std.testing.expectEqual(StorageBackend.profile_file, selectStorageBackend(.linux, false));
+    try std.testing.expectEqual(StorageBackend.profile_file, selectStorageBackend(.windows, false));
+}
+
+test "OAuth source resolution covers every file and Keychain state" {
+    const cases = [_]struct {
+        file: FileState,
+        keychain: KeychainState,
+        expected: Resolution,
+    }{
+        .{ .file = .absent, .keychain = .absent, .expected = .missing },
+        .{ .file = .absent, .keychain = .valid, .expected = .keychain },
+        .{ .file = .absent, .keychain = .invalid, .expected = .storage_error },
+        .{ .file = .absent, .keychain = .unavailable, .expected = .storage_error },
+        .{ .file = .valid, .keychain = .absent, .expected = .file_migrate },
+        .{ .file = .valid, .keychain = .valid, .expected = .file_migrate },
+        .{ .file = .valid, .keychain = .invalid, .expected = .file_migrate },
+        .{ .file = .valid, .keychain = .unavailable, .expected = .file_defer_migration },
+        .{ .file = .unusable, .keychain = .valid, .expected = .keychain },
+        .{ .file = .unusable, .keychain = .absent, .expected = .missing },
+        .{ .file = .unusable, .keychain = .invalid, .expected = .storage_error },
+        .{ .file = .unusable, .keychain = .unavailable, .expected = .storage_error },
+    };
+
+    for (cases) |case| {
+        try std.testing.expectEqual(case.expected, selectResolution(case.file, case.keychain));
+    }
+}
+
+const alternate_test_session_json = "{\"version\":1,\"issuer\":\"https://vercel.com\",\"client_id\":\"client\",\"access_token\":\"keychain-access\",\"refresh_token\":\"keychain-refresh\",\"expires_at_ms\":2,\"scope\":\"openid offline_access\",\"token_type\":\"Bearer\"}";
+
+const FakeOAuthKeychain = struct {
+    alloc: Allocator,
+    value: ?[]u8 = null,
+    store_calls: usize = 0,
+    delete_calls: usize = 0,
+    fail_store: bool = false,
+    fail_delete: bool = false,
+
+    fn deinit(self: *FakeOAuthKeychain) void {
+        if (self.value) |value| secret.zeroAndFree(self.alloc, value);
+        self.* = undefined;
+    }
+
+    fn backend(self: *FakeOAuthKeychain) KeychainBackend {
+        return .{
+            .context = self,
+            .load_fn = loadCallback,
+            .store_fn = storeCallback,
+            .delete_fn = deleteCallback,
+        };
+    }
+
+    fn loadCallback(raw: ?*anyopaque, alloc: Allocator) KeychainError!?[]u8 {
+        const self: *FakeOAuthKeychain = @ptrCast(@alignCast(raw.?));
+        const value = self.value orelse return null;
+        return try alloc.dupe(u8, value);
+    }
+
+    fn storeCallback(raw: ?*anyopaque, value: []const u8) KeychainError!void {
+        const self: *FakeOAuthKeychain = @ptrCast(@alignCast(raw.?));
+        self.store_calls += 1;
+        if (self.fail_store) return error.KeychainWriteFailed;
+        const replacement = try self.alloc.dupe(u8, value);
+        if (self.value) |previous| secret.zeroAndFree(self.alloc, previous);
+        self.value = replacement;
+    }
+
+    fn deleteCallback(raw: ?*anyopaque, _: Allocator) KeychainError!bool {
+        const self: *FakeOAuthKeychain = @ptrCast(@alignCast(raw.?));
+        self.delete_calls += 1;
+        if (self.fail_delete) return error.KeychainDeleteFailed;
+        const previous = self.value orelse return false;
+        secret.zeroAndFree(self.alloc, previous);
+        self.value = null;
+        return true;
+    }
+};
+
+fn writeTestAuthFile(dir: std.Io.Dir, contents: []const u8) !void {
+    var file = try dir.createFile(std.testing.io, auth_file_name, .{
+        .truncate = true,
+        .permissions = std.Io.File.Permissions.fromMode(0o600),
+    });
+    defer file.close(std.testing.io);
+    try file.writeStreamingAll(std.testing.io, contents);
+}
+
+fn testKeychainMutation(dir: std.Io.Dir, keychain: KeychainBackend) !Mutation {
+    return lockMutationWithBackend(
+        .{ .dir = try dir.openDir(std.testing.io, ".", .{ .iterate = true }) },
+        0,
+        .{},
+        .macos_keychain,
+        keychain,
+    );
+}
+
+test "OAuth migration keeps a valid file authoritative until verified cleanup" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeTestAuthFile(tmp.dir, test_session_json);
+
+    var fake = FakeOAuthKeychain{
+        .alloc = alloc,
+        .value = try alloc.dupe(u8, alternate_test_session_json),
+    };
+    defer fake.deinit();
+    var mutation = try testKeychainMutation(tmp.dir, fake.backend());
+    defer mutation.deinit();
+
+    var loaded = (try mutation.load(alloc)).?;
+    defer loaded.deinit(alloc);
+    try std.testing.expectEqualStrings("access", loaded.access_token);
+    try std.testing.expectEqual(@as(usize, 1), fake.store_calls);
+    try std.testing.expectEqual(Authority.keychain, mutation.authority);
+    try std.testing.expectError(
+        error.FileNotFound,
+        tmp.dir.statFile(std.testing.io, auth_file_name, .{}),
+    );
+
+    var persisted = try parse(alloc, fake.value.?);
+    defer persisted.deinit(alloc);
+    try std.testing.expectEqualStrings("access", persisted.access_token);
+
+    secret.zeroAndFree(alloc, loaded.access_token);
+    loaded.access_token = try alloc.dupe(u8, "keychain-only-update");
+    try mutation.save(alloc, loaded);
+    try std.testing.expectError(
+        error.FileNotFound,
+        tmp.dir.statFile(std.testing.io, auth_file_name, .{}),
+    );
+    var updated = try parse(alloc, fake.value.?);
+    defer updated.deinit(alloc);
+    try std.testing.expectEqualStrings("keychain-only-update", updated.access_token);
+}
+
+test "new OAuth login replaces an existing file before deferred migration" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeTestAuthFile(tmp.dir, test_session_json);
+
+    var fake = FakeOAuthKeychain{ .alloc = alloc, .fail_store = true };
+    defer fake.deinit();
+    var mutation = try testKeychainMutation(tmp.dir, fake.backend());
+    defer mutation.deinit();
+    var replacement = try parse(alloc, alternate_test_session_json);
+    defer replacement.deinit(alloc);
+
+    try mutation.save(alloc, replacement);
+    var persisted = (try loadFromDir(alloc, &tmp.dir, .report_open_failure)).?;
+    defer persisted.deinit(alloc);
+    try std.testing.expectEqualStrings("keychain-access", persisted.access_token);
+    try std.testing.expectEqual(Authority.profile_file, mutation.authority);
+}
+
+test "OAuth migration preserves and updates the file when Keychain publication fails" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeTestAuthFile(tmp.dir, test_session_json);
+
+    var fake = FakeOAuthKeychain{ .alloc = alloc, .fail_store = true };
+    defer fake.deinit();
+    var mutation = try testKeychainMutation(tmp.dir, fake.backend());
+    defer mutation.deinit();
+
+    var loaded = (try mutation.load(alloc)).?;
+    defer loaded.deinit(alloc);
+    try std.testing.expectEqual(Authority.profile_file, mutation.authority);
+    secret.zeroAndFree(alloc, loaded.access_token);
+    loaded.access_token = try alloc.dupe(u8, "updated-access");
+    try mutation.save(alloc, loaded);
+
+    var persisted = (try loadFromDir(alloc, &tmp.dir, .report_open_failure)).?;
+    defer persisted.deinit(alloc);
+    try std.testing.expectEqualStrings("updated-access", persisted.access_token);
+    try std.testing.expectEqual(@as(usize, 2), fake.store_calls);
+}
+
+test "OAuth resolver uses valid Keychain state without deleting an unusable file" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeTestAuthFile(tmp.dir, "not-json");
+
+    var fake = FakeOAuthKeychain{
+        .alloc = alloc,
+        .value = try alloc.dupe(u8, alternate_test_session_json),
+    };
+    defer fake.deinit();
+    var mutation = try testKeychainMutation(tmp.dir, fake.backend());
+    defer mutation.deinit();
+
+    var loaded = (try mutation.load(alloc)).?;
+    defer loaded.deinit(alloc);
+    try std.testing.expectEqualStrings("keychain-access", loaded.access_token);
+    _ = try tmp.dir.statFile(std.testing.io, auth_file_name, .{});
+}
+
+test "OAuth resolver reports invalid Keychain state when no valid file exists" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var fake = FakeOAuthKeychain{
+        .alloc = alloc,
+        .value = try alloc.dupe(u8, "not-json"),
+    };
+    defer fake.deinit();
+    var mutation = try testKeychainMutation(tmp.dir, fake.backend());
+    defer mutation.deinit();
+
+    try std.testing.expectError(error.InvalidOAuthKeychainSession, mutation.load(alloc));
+}
+
+test "OAuth logout deletion attempts Keychain and file cleanup independently" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeTestAuthFile(tmp.dir, test_session_json);
+    var fake = FakeOAuthKeychain{
+        .alloc = alloc,
+        .value = try alloc.dupe(u8, alternate_test_session_json),
+        .fail_delete = true,
+    };
+    defer fake.deinit();
+    var mutation = try testKeychainMutation(tmp.dir, fake.backend());
+    defer mutation.deinit();
+
+    const result = try mutation.delete(alloc);
+    try std.testing.expect(result.session_deleted);
+    try std.testing.expect(result.local_cleanup_failed);
+    try std.testing.expectEqual(@as(usize, 1), fake.delete_calls);
+    try std.testing.expectError(
+        error.FileNotFound,
+        tmp.dir.statFile(std.testing.io, auth_file_name, .{}),
+    );
+}
+
 test "JS host OAuth session load commit and remove preserve the native format and revision" {
     var state: HostStoreTestState = .{};
     var loaded = (try loadFromHost(std.testing.allocator, state.provider())).?;
@@ -653,7 +1320,9 @@ test "JS host OAuth session load commit and remove preserve the native format an
     try std.testing.expect(state.expected_revision_matched);
     try std.testing.expect(state.committed_format_matched);
 
-    try std.testing.expectEqual(DeleteOutcome.deleted, try mutation.delete());
+    const deleted = try mutation.delete(std.testing.allocator);
+    try std.testing.expect(deleted.session_deleted);
+    try std.testing.expect(!deleted.local_cleanup_failed);
     try std.testing.expectEqual(@as(usize, 1), state.remove_count);
     try std.testing.expect(state.expected_revision_matched);
 }
@@ -709,10 +1378,10 @@ test "OAuth mutation loads report auth file open failures" {
     defer tmp.cleanup();
     try tmp.dir.symLink(std.testing.io, "missing-auth-target", auth_file_name, .{ .is_directory = false });
 
-    try std.testing.expect((try loadFromDir(std.testing.allocator, &tmp.dir, auth_file_name, null, .tolerate_open_failure)) == null);
+    try std.testing.expect((try loadFromDir(std.testing.allocator, &tmp.dir, .tolerate_open_failure)) == null);
     try std.testing.expectError(
         error.SymLinkLoop,
-        loadFromDir(std.testing.allocator, &tmp.dir, auth_file_name, null, .report_open_failure),
+        loadFromDir(std.testing.allocator, &tmp.dir, .report_open_failure),
     );
 }
 
@@ -765,10 +1434,10 @@ test "OAuth session deletion reports deleted and missing files" {
         .ctx = &probe,
         .sync_dir = DeleteSyncProbe.syncDir,
     };
-    const deleted = try deleteSessionFile(&tmp.dir, auth_file_name, ops);
+    const deleted = try deleteAuthFile(&tmp.dir, ops);
     try std.testing.expectEqual(DeleteOutcome.deleted, deleted);
     try std.testing.expectEqual(@as(usize, 1), probe.sync_count);
-    const missing = try deleteSessionFile(&tmp.dir, auth_file_name, ops);
+    const missing = try deleteAuthFile(&tmp.dir, ops);
     try std.testing.expectEqual(DeleteOutcome.missing, missing);
     try std.testing.expectEqual(@as(usize, 1), probe.sync_count);
 }
@@ -785,7 +1454,7 @@ test "OAuth session deletion reports directory sync failure after unlink" {
         .ctx = &probe,
         .sync_dir = DeleteSyncProbe.syncDir,
     };
-    const outcome = try deleteSessionFile(&tmp.dir, auth_file_name, ops);
+    const outcome = try deleteAuthFile(&tmp.dir, ops);
     try std.testing.expectEqual(DeleteOutcome.deleted_not_durable, outcome);
     try std.testing.expectEqual(@as(usize, 1), probe.sync_count);
     try std.testing.expectError(
@@ -794,7 +1463,7 @@ test "OAuth session deletion reports directory sync failure after unlink" {
     );
 
     probe.fail = false;
-    const missing = try deleteSessionFile(&tmp.dir, auth_file_name, ops);
+    const missing = try deleteAuthFile(&tmp.dir, ops);
     try std.testing.expectEqual(DeleteOutcome.missing, missing);
     try std.testing.expectEqual(@as(usize, 1), probe.sync_count);
 }

@@ -69,16 +69,30 @@ pub const Resolver = struct {
     }
 };
 
-fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
-    if (needle.len == 0) return true;
-    if (needle.len > haystack.len) return false;
-
-    const last_start = haystack.len - needle.len;
-    var i: usize = 0;
-    while (i <= last_start) : (i += 1) {
-        if (std.ascii.eqlIgnoreCase(haystack[i .. i + needle.len], needle)) return true;
+pub fn mergeCapabilities(capabilities_value: Capabilities, gateway_metadata: ?GatewayMetadata) Capabilities {
+    var capabilities = capabilities_value;
+    if (gateway_metadata) |metadata| {
+        capabilities.supports_reasoning = metadata.supports_reasoning or metadata.reasoning_efforts.len > 0;
+        capabilities.reasoning_efforts = metadata.reasoning_efforts;
+        capabilities.supports_fast_mode = metadata.supports_fast_mode;
+        capabilities.supports_tool_use = metadata.supports_tool_use;
+        capabilities.supports_vision = metadata.supports_vision;
+        capabilities.supports_file_input = metadata.supports_file_input;
+        capabilities.supports_web_search = metadata.supports_web_search;
+        capabilities.supports_explicit_caching = metadata.supports_explicit_caching;
+        capabilities.supports_implicit_caching = metadata.supports_implicit_caching;
+        if (metadata.context_window) |window| capabilities.context_window = window;
+        if (metadata.max_output_tokens) |tokens| capabilities.max_output_tokens = tokens;
     }
-    return false;
+    return capabilities;
+}
+
+pub fn resolveCapabilities(model: []const u8, gateway_metadata: ?GatewayMetadata) Capabilities {
+    return mergeCapabilities(localCapabilitiesForModel(model), gateway_metadata);
+}
+
+pub fn capabilitiesForModel(model: []const u8) Capabilities {
+    return resolveCapabilities(model, null);
 }
 
 fn localCapabilitiesForModel(model: []const u8) Capabilities {
@@ -119,35 +133,8 @@ fn localCapabilitiesForModel(model: []const u8) Capabilities {
         capabilities.parallel_tool_calls = true;
         capabilities.context_window = 256_000;
         capabilities.max_output_tokens = 64_000;
-    } else if (std.mem.startsWith(u8, model, "anthropic/")) {
-        capabilities.prompt_caching = true;
-    } else if (std.mem.startsWith(u8, model, "xai/")) {
-        capabilities.parallel_tool_calls = true;
-    }
-    if (localContextWindowSize(model)) |window| capabilities.context_window = window;
-    return capabilities;
-}
-
-pub fn resolveCapabilities(model: []const u8, gateway_metadata: ?GatewayMetadata) Capabilities {
-    var capabilities = localCapabilitiesForModel(model);
-    if (gateway_metadata) |metadata| {
-        capabilities.supports_reasoning = metadata.supports_reasoning or metadata.reasoning_efforts.len > 0;
-        capabilities.reasoning_efforts = metadata.reasoning_efforts;
-        capabilities.supports_fast_mode = metadata.supports_fast_mode;
-        capabilities.supports_tool_use = metadata.supports_tool_use;
-        capabilities.supports_vision = metadata.supports_vision;
-        capabilities.supports_file_input = metadata.supports_file_input;
-        capabilities.supports_web_search = metadata.supports_web_search;
-        capabilities.supports_explicit_caching = metadata.supports_explicit_caching;
-        capabilities.supports_implicit_caching = metadata.supports_implicit_caching;
-        if (metadata.context_window) |window| capabilities.context_window = window;
-        if (metadata.max_output_tokens) |tokens| capabilities.max_output_tokens = tokens;
     }
     return capabilities;
-}
-
-pub fn capabilitiesForModel(model: []const u8) Capabilities {
-    return resolveCapabilities(model, null);
 }
 
 pub fn resolveForApp(comptime App: type, app: *App, model: []const u8) Capabilities {
@@ -185,44 +172,6 @@ pub fn reasoningEffortLabelAtIndex(capabilities: *const Capabilities, index: usi
 
 pub fn reasoningEffortOptionCount(capabilities: Capabilities) usize {
     return if (capabilities.reasoning_efforts.len == 0) 0 else capabilities.reasoning_efforts.len + 1;
-}
-
-fn localContextWindowSize(model: []const u8) ?u32 {
-    if (std.mem.startsWith(u8, model, "anthropic/")) {
-        const million_context_models = [_][]const u8{
-            "anthropic/claude-fable-5",
-            "anthropic/claude-opus-4.6",
-            "anthropic/claude-opus-4-6",
-            "anthropic/claude-opus-4.7",
-            "anthropic/claude-opus-4-7",
-            "anthropic/claude-opus-4.8",
-            "anthropic/claude-opus-4-8",
-            "anthropic/claude-sonnet-5",
-            "anthropic/claude-sonnet-4.6",
-            "anthropic/claude-sonnet-4-6",
-        };
-        for (million_context_models) |candidate| {
-            if (std.mem.eql(u8, model, candidate)) return 1_000_000;
-        }
-        return 200_000;
-    }
-    if (std.mem.startsWith(u8, model, "openai/")) {
-        if (containsIgnoreCase(model, "gpt-5")) return 256_000;
-        if (containsIgnoreCase(model, "o3") or containsIgnoreCase(model, "o4") or containsIgnoreCase(model, "o1"))
-            return 200_000;
-        return 128_000;
-    }
-    if (std.mem.startsWith(u8, model, "xai/")) return 131_072;
-    if (std.mem.startsWith(u8, model, "google/")) return 1_000_000;
-    return null;
-}
-
-pub fn contextWindowSize(model: []const u8) ?u32 {
-    return capabilitiesForModel(model).context_window;
-}
-
-pub fn resolveProviderOptions(model: []const u8, effort: types.ReasoningEffort, fast_mode: bool) ResolvedProviderOptions {
-    return resolveProviderOptionsForCapabilities(capabilitiesForModel(model), effort, fast_mode);
 }
 
 pub fn resolveProviderOptionsForCapabilities(
@@ -271,12 +220,12 @@ test "direct provider routes expose their local runtime capabilities" {
     try std.testing.expect(xai.supports_tool_use);
 }
 
-test "resolveCapabilities preserves Gateway controls and unrelated local policy" {
+test "mergeCapabilities preserves provider controls and supplied fallback policy" {
     const efforts = [_]types.ReasoningEffort{
         types.ReasoningEffort.literal("future-tier"),
         types.ReasoningEffort.literal("high"),
     };
-    const capabilities = resolveCapabilities("anthropic/claude-future", .{
+    const capabilities = mergeCapabilities(.{ .prompt_caching = true }, .{
         .reasoning_efforts = .fromSlice(&efforts),
         .supports_fast_mode = true,
         .supports_tool_use = true,
@@ -379,12 +328,8 @@ test "request controls remain safe across repeated state transitions" {
     }
 }
 
-test "local non-control capabilities remain available" {
-    const anthropic = capabilitiesForModel("anthropic/claude-any");
-    try std.testing.expect(anthropic.prompt_caching);
-    try std.testing.expectEqual(@as(?u32, 200_000), anthropic.context_window);
-
-    const xai = capabilitiesForModel("xai/grok-any");
-    try std.testing.expectEqual(@as(?bool, true), xai.parallel_tool_calls);
-    try std.testing.expectEqual(@as(?u32, 131_072), xai.context_window);
+test "generic fallback capabilities contain no vendor policy" {
+    const fallback = capabilitiesForModel("anthropic/claude-any");
+    try std.testing.expect(!fallback.prompt_caching);
+    try std.testing.expect(fallback.context_window == null);
 }

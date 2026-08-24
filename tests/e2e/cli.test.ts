@@ -314,7 +314,7 @@ Usage:
 
 Options:
   --auto                Automatically review unresolved permission requests
-  --yolo                Disable permission checks and command sandboxing
+  --yolo                Disable fx permission checks
   --image PATH          Attach an image file; repeat for multiple images
   --json                Emit machine-readable JSON instead of text
   --quiet               Suppress assistant output
@@ -570,6 +570,7 @@ describe("cli: status", () => {
           auth_refreshable: false,
           auth_help: MISSING_AUTH_MESSAGE,
         });
+        expect(statusJson).not.toHaveProperty("sandbox");
         expect(doctorJson).toMatchObject({
           auth: "missing",
           auth_refreshable: false,
@@ -3425,6 +3426,7 @@ describe("cli: models", () => {
   test(
     "fx models rejects E2E gateway redirects without contacting the target",
     async () => {
+      const home = createIsolatedTestHome();
       const captureRequests: string[] = [];
       const captureServer = Bun.serve({
         hostname: "127.0.0.1",
@@ -3447,6 +3449,8 @@ describe("cli: models", () => {
       try {
         const r = await runFx(["models", "--json"], {
           env: {
+            HOME: home,
+            FX_DISABLE_KEYCHAIN: "1",
             AI_GATEWAY_API_KEY: "redirect-proof-key",
             VERCEL_OIDC_TOKEN: undefined,
             FX_E2E_GATEWAY_MODELS_URL: `http://127.0.0.1:${redirectServer.port}/v1/models`,
@@ -3464,6 +3468,7 @@ describe("cli: models", () => {
       } finally {
         redirectServer.stop(true);
         captureServer.stop(true);
+        cleanupIsolatedTestHome(home);
       }
     },
     TIMEOUT,

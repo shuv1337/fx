@@ -1,4 +1,6 @@
 const std = @import("std");
+const builtin_tools = @import("../../../../builtins/tools.zig");
+const model_tool_schema = @import("../../../tooling/model_tool_schema.zig");
 const types = @import("../../../shared/types.zig");
 const session_runtime = @import("../../../session/session.zig");
 const debug_trace = @import("../../../shared/debug_trace.zig");
@@ -12,8 +14,8 @@ const ToolCall = types.ToolCall;
 
 const removed_direct_question_guidance = "Treat it as interrupting any previous tool plan.";
 const removed_resume_guidance = "Continue from the latest meaningful state";
-const fixture_tools_json =
-    "[{\"type\":\"function\",\"name\":\"read_file\",\"description\":\"Read a file\",\"inputSchema\":{\"type\":\"object\",\"properties\":{}}}]";
+const read_file_advertised_names = [_][]const u8{"read_file"};
+const read_file_advertised_functions = [_]model_tool_schema.FunctionSchema{builtin_tools.read_file.model_schema};
 
 const FakeCompletion = test_support.FakeCompletion;
 const FakeGateway = test_support.FakeGateway;
@@ -109,7 +111,8 @@ test "processQueuedPrompt sends former intent text normally with tools" {
         var job = fixture.job();
         job.prompt = @constCast(text);
         var config = fixture.config();
-        config.gateway_tools_json = fixture_tools_json;
+        config.advertised_tool_names = &read_file_advertised_names;
+        config.advertised_functions = &read_file_advertised_functions;
 
         try runFakePrompt(&gateway, &hooks, config, job);
 
@@ -259,7 +262,7 @@ test "processQueuedPrompt cancellation after valid tool finish settles streamed 
     });
 }
 
-test "processQueuedPrompt in-stream cancellation settles every provisional start" {
+test "processQueuedPrompt in-stream cancellation settles every eligible provisional start" {
     const alloc = std.testing.allocator;
     const calls = [_]ToolCall{
         toolCall("call_command", "terminal", "{}"),
@@ -283,7 +286,6 @@ test "processQueuedPrompt in-stream cancellation settles every provisional start
     try std.testing.expectEqual(@as(usize, 1), hooks.interrupted_event_count);
     try std.testing.expectEqual(@as(usize, 1), hooks.finish_event_count);
     try expectToolTerminalsBeforeTurnFinished(&hooks, &.{
-        .{ .call_id = "call_command", .kind = .cancelled },
         .{ .call_id = "call_read", .kind = .cancelled },
     });
 }
@@ -499,7 +501,7 @@ test "processQueuedPrompt retains cancelled command artifact for presentation on
     const artifact_handle = "fx-command-cancelled.log";
     const result_output = "RESULT-ONLY-OUTPUT-SENTINEL\nTERM-TAIL-SENTINEL\n";
     const result_json =
-        "{\"kind\":\"foreground\",\"command\":\"sleep 5\",\"cwd\":\"/tmp/RESULT-JSON-ONLY-SENTINEL\",\"exit_code\":null,\"signal\":15,\"timed_out\":false,\"duration_ms\":7,\"stdout_bytes\":49,\"stderr_bytes\":0,\"truncated\":false,\"output_file\":\"" ++ artifact_path ++ "\",\"stdout_file\":null,\"stderr_file\":null,\"sandbox_denied\":false}";
+        "{\"kind\":\"foreground\",\"command\":\"sleep 5\",\"cwd\":\"/tmp/RESULT-JSON-ONLY-SENTINEL\",\"exit_code\":null,\"signal\":15,\"timed_out\":false,\"duration_ms\":7,\"stdout_bytes\":49,\"stderr_bytes\":0,\"truncated\":false,\"output_file\":\"" ++ artifact_path ++ "\",\"stdout_file\":null,\"stderr_file\":null}";
     const calls = [_]ToolCall{toolCall("call_cancelled_command", "terminal", "{\"action\":\"exec\",\"command\":\"sleep 5\"}")};
     const completions = [_]FakeCompletion{.{ .tool_calls = &calls }};
     var gateway = FakeGateway.init(alloc, &completions);

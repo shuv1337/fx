@@ -85,7 +85,9 @@ If you cannot manage labels, a maintainer or repository agent will apply the lab
 
 * `src/gateway/`: AI Gateway client transport
 
-* `skills/`: optional workspace-level skill root if the project wants one
+* `.fx/skills/`: optional fx-native workspace-level skill root
+
+* `skills/`: optional shared workspace-level skill root
 
 ## Collaboration Rules
 
@@ -143,13 +145,13 @@ Subagent children are ordinary sessions with their own `~/.fx/sessions/<child-id
 
 There are two distinct skill categories in `fx`:
 
-* `fx` roots that belong to the product itself: `skills/`, `~/.fx/skills`
+* `fx` roots that belong to the product itself: `.fx/skills`, `skills/`, `~/.fx/skills`
 
 * compatibility roots discovered for other agent installs: `.opencode/skills`, `.codex/skills`, `.claude/skills`, `.agents/skills`, `.claw/skills`, plus their global equivalents
 
 `/skills list` should make that distinction visible to the user.
 
-`/skills add` and `/skills install` install full skill directories into the profile-owned `~/.fx/skills` managed root, not just `SKILL.md`. Workspace `skills/` remains discoverable project-local instructions, not a managed install target.
+`/skills add` and `/skills install` install full skill directories into the profile-owned `~/.fx/skills` managed root, not just `SKILL.md`. Workspace `.fx/skills` and `skills/` remain discoverable project-local instructions, not managed install targets.
 
 The interactive agent can also install skills via the `install_skill` tool when the user asks to install one in conversation, including pasted `npx skills add ...` syntax.
 
@@ -243,11 +245,11 @@ Security is permission-first.
 
 * routine parsed development commands and reversible new-file creation can execute without model review after configured and saved-session policy; unknown, destructive, hidden, credential-bearing, public, and overwrite effects remain on the review or approval path
 
-* unresolved sensitive calls in `auto` mode receive one exact automatic review using bounded current, first, and recent proven root requests; historical permission feedback is excluded, and non-allow, unavailable, and invalid review results return a recoverable denial with an opaque action-bound approval request when capacity permits
+* every unresolved `auto` action receives one narrow safety review after configured policy, saved-session rules, grants, and deterministic safe authority; review input contains the current proven root request, the exact action and targets, origin and call identity, optional host-proven current-branch evidence, exact-copy provenance, and bounded masked terminal-safe excerpts of earlier current-turn tool results. Those excerpts are untrusted evidence and never authority; assistant prose, permission feedback, the pending tool group, later results, and historical requests do not enter review
 
-* the main agent may pass that exact request ID through `ask_user_question` to open the existing permission screen; generic question text cannot authorize an action, and the resulting once or always approval is revalidated and consumed only by the exact bound action
+* a `clear` review authorizes only the exact unchanged action; a `caution` or unavailable review holds only that action and returns advice without opening a human permission screen, disabling tools, or ending the turn
 
-* after three consecutive all-blocked response groups, the next unresolved sensitive action skips another automatic review and uses the existing human approval path; any completed successful tool resets that recovery count, and configured and saved-session rules remain authoritative
+* exact cautions are cached only for the current turn; changed actions receive a new review, unavailable reviews are not cached as security judgments, and legacy `permission_request_id` input is rejected without prompting
 
 * the sandbox backend is configured independently; yolo uses an effective backend of `none` without rewriting the saved sandbox setting
 

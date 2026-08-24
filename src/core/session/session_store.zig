@@ -6,6 +6,7 @@ const image_attachments = @import("../images/image_attachments.zig");
 const io_mod = @import("../shared/io.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
 const core_types = @import("../shared/types.zig");
+const session_permission_state = @import("../permissions/session_permission_state.zig");
 const artifact_digest = @import("artifact_digest.zig");
 const command_replay_store = @import("command_replay_store.zig");
 const result_store = @import("result_store.zig");
@@ -853,15 +854,50 @@ pub const Store = struct {
         alloc: Allocator,
         loaded: *LoadedWritableSession,
     ) PristineDiscardDisposition {
-        defer loaded.deinit(alloc);
-        if (self.canonical_root.mode != .writable or
-            !std.mem.eql(u8, self.workspace_root, loaded.state.workspace_root) or
-            !isPristineStartedSession(loaded))
-        {
+        if (!isPristineStartedSession(loaded)) {
+            loaded.deinit(alloc);
             debug_trace.logf(
                 "session",
                 "event=pristine_session_discard disposition=retained reason=guard_failed",
                 .{},
+            );
+            return .retained;
+        }
+        return self.deleteWriterOwnedSession(
+            alloc,
+            loaded,
+            "pristine_session_discard",
+        );
+    }
+
+    /// Consumes an exact writable session on every return. Policy checks such
+    /// as terminal one-off admission remain with the caller that owns them.
+    pub fn deleteCommittedSession(
+        self: Store,
+        alloc: Allocator,
+        loaded: *LoadedWritableSession,
+    ) PristineDiscardDisposition {
+        return self.deleteWriterOwnedSession(
+            alloc,
+            loaded,
+            "committed_session_delete",
+        );
+    }
+
+    fn deleteWriterOwnedSession(
+        self: Store,
+        alloc: Allocator,
+        loaded: *LoadedWritableSession,
+        event_name: []const u8,
+    ) PristineDiscardDisposition {
+        defer loaded.deinit(alloc);
+        if (self.canonical_root.mode != .writable or
+            !std.mem.eql(u8, self.workspace_root, loaded.state.workspace_root))
+        {
+            debug_trace.logf(
+                "session",
+                "event={s} disposition=retained reason=guard_failed",
+                .{event_name},
             );
             return .retained;
         }
@@ -872,32 +908,32 @@ pub const Store = struct {
         ) catch |err| {
             debug_trace.logf(
                 "session",
-                "event=pristine_session_discard disposition=retained reason=store_root_unverified err={s}",
-                .{@errorName(err)},
+                "event={s} disposition=retained reason=store_root_unverified err={s}",
+                .{ event_name, @errorName(err) },
             );
             return .retained;
         };
         if (!writer_belongs_to_store) {
             debug_trace.logf(
                 "session",
-                "event=pristine_session_discard disposition=retained reason=store_root_mismatch",
-                .{},
+                "event={s} disposition=retained reason=store_root_mismatch",
+                .{event_name},
             );
             return .retained;
         }
         const lifecycle = if (loaded.commit_lifecycle) |*value| value else {
             debug_trace.logf(
                 "session",
-                "event=pristine_session_discard disposition=retained reason=cache_lifecycle_unavailable",
-                .{},
+                "event={s} disposition=retained reason=cache_lifecycle_unavailable",
+                .{event_name},
             );
             return .retained;
         };
         const sessions = &(self.canonical_root.sessions orelse {
             debug_trace.logf(
                 "session",
-                "event=pristine_session_discard disposition=indeterminate stage=sessions_root",
-                .{},
+                "event={s} disposition=indeterminate stage=sessions_root",
+                .{event_name},
             );
             return .indeterminate;
         });
@@ -911,24 +947,24 @@ pub const Store = struct {
         ) catch |err| {
             debug_trace.logf(
                 "session",
-                "event=pristine_session_discard disposition=indeterminate stage=cache_pending err={s}",
-                .{@errorName(err)},
+                "event={s} disposition=indeterminate stage=cache_pending err={s}",
+                .{ event_name, @errorName(err) },
             );
             return .indeterminate;
         };
         sessions.dir.deleteTree(io_mod.getIo(), loaded.active_id) catch |err| {
             debug_trace.logf(
                 "session",
-                "event=pristine_session_discard disposition=indeterminate stage=delete err={s}",
-                .{@errorName(err)},
+                "event={s} disposition=indeterminate stage=delete err={s}",
+                .{ event_name, @errorName(err) },
             );
             return .indeterminate;
         };
         io_mod.syncVerifiedDir(sessions.dir) catch |err| {
             debug_trace.logf(
                 "session",
-                "event=pristine_session_discard disposition=indeterminate stage=sync err={s}",
-                .{@errorName(err)},
+                "event={s} disposition=indeterminate stage=sync err={s}",
+                .{ event_name, @errorName(err) },
             );
             return .indeterminate;
         };
@@ -938,15 +974,15 @@ pub const Store = struct {
         ) catch |err| {
             debug_trace.logf(
                 "session",
-                "event=pristine_session_discard disposition=indeterminate stage=deferred_token_cleanup err={s}",
-                .{@errorName(err)},
+                "event={s} disposition=indeterminate stage=deferred_token_cleanup err={s}",
+                .{ event_name, @errorName(err) },
             );
             return .indeterminate;
         };
         debug_trace.logf(
             "session",
-            "event=pristine_session_discard disposition=discarded",
-            .{},
+            "event={s} disposition=discarded",
+            .{event_name},
         );
         return .discarded;
     }
@@ -1049,6 +1085,17 @@ pub const Store = struct {
     ) !LoadedWritableSession {
         var loaded = loaded_value;
         errdefer loaded.deinit(alloc);
+        const needs_permission_migration =
+            loaded.state.permission_state.version !=
+            session_permission_state.schema_version;
+        if (needs_permission_migration) {
+            const migrated_permission_state = try session_permission_state.migrateV1ToV2(
+                alloc,
+                loaded.state.permission_state,
+            );
+            loaded.state.permission_state.deinit(alloc);
+            loaded.state.permission_state = migrated_permission_state;
+        }
         var migration_state = try loaded.state.dupe(alloc);
         defer migration_state.deinit(alloc);
         const session_dir = try sessionDirPath(
@@ -1059,11 +1106,13 @@ pub const Store = struct {
         defer alloc.free(session_dir);
         const snapshot_dir = try std.fs.path.join(alloc, &.{ session_dir, "images" });
         defer alloc.free(snapshot_dir);
-        const needs_migration_commit = try session.repair_legacy_images_transactionally(
+        const needs_image_migration = try session.repair_legacy_images_transactionally(
             alloc,
             migration_state.history,
             snapshot_dir,
         );
+        const needs_migration_commit = needs_permission_migration or
+            needs_image_migration;
         if (needs_migration_commit) {
             var migration_committed = false;
             errdefer if (!migration_committed) {
@@ -1595,7 +1644,7 @@ pub const Store = struct {
         return .{
             .model = try alloc.dupe(
                 u8,
-                detailed.settings.model orelse "anthropic/claude-opus-4.7",
+                detailed.settings.models.get(.gateway) orelse "anthropic/claude-opus-4.7",
             ),
             .effort = detailed.settings.effort orelse .auto,
             .fast_mode = detailed.settings.fast_mode orelse false,
@@ -5044,6 +5093,43 @@ fn writeSessionFixture(alloc: Allocator, store: Store, id: []const u8, text: []c
     return path;
 }
 
+test "resume commits legacy permission state migration before publication" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ctx = try initTempStore(alloc, &tmp);
+    defer ctx.deinit(alloc);
+
+    var state = try testDurableState(alloc, "permission-migration", ctx.workspace);
+    defer state.deinit(alloc);
+    var started = try ctx.store.startWritableSession(alloc, state);
+    started.log.park();
+    started.deinit(alloc);
+
+    var legacy = try ctx.store.resumeExactForWrite(
+        alloc,
+        "permission-migration",
+        ctx.workspace,
+        true,
+        .{},
+    );
+    legacy.state.permission_state.version = 1;
+    var migrated = try ctx.store.finishResumedForWrite(alloc, legacy, .{});
+    try std.testing.expectEqual(
+        session_permission_state.schema_version,
+        migrated.state.permission_state.version,
+    );
+    migrated.log.park();
+    migrated.deinit(alloc);
+
+    var resumed = try ctx.store.resumeForWrite(alloc, "permission-migration");
+    defer resumed.deinit(alloc);
+    try std.testing.expectEqual(
+        session_permission_state.schema_version,
+        resumed.state.permission_state.version,
+    );
+}
+
 fn chmodPath(alloc: Allocator, path: []const u8, mode: std.c.mode_t) !void {
     const path_z = try alloc.dupeZ(u8, path);
     defer alloc.free(path_z);
@@ -6240,7 +6326,7 @@ test "pristine discard retains active recovery and permits cleared recovery" {
         .assistant_source = @constCast(""),
         .cause = .network_interrupted,
         .action = .retrying_request,
-        .route_model = @constCast("test/model"),
+        .authority = .{ .provider = .gateway, .model = @constCast("test/model") },
         .requested_fast_mode = false,
         .fast_mode = false,
         .max_provider_attempts = 10,
@@ -6379,6 +6465,34 @@ test "pristine discard refuses resumed and committed writers" {
         return error.TestExpectedEqual;
     defer latest.deinit(alloc);
     try std.testing.expectEqualStrings(committed_state.id, latest.session_id);
+}
+
+test "committed session deletion consumes its exact writer" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ctx = try initTempStore(alloc, &tmp);
+    defer ctx.deinit(alloc);
+
+    var state = try testDurableState(alloc, "delete-committed", ctx.workspace);
+    defer state.deinit(alloc);
+    var writable = try ctx.store.startWritableSession(alloc, state);
+    _ = try writable.appendEvent(
+        alloc,
+        .{ .preferences_changed = .{ .fast_mode = true } },
+        20,
+        .retry_expected_tail,
+        .{},
+    );
+
+    try std.testing.expectEqual(
+        PristineDiscardDisposition.discarded,
+        ctx.store.deleteCommittedSession(alloc, &writable),
+    );
+    try std.testing.expectError(
+        error.SessionNotFound,
+        ctx.store.loadReadOnly(alloc, state.id),
+    );
 }
 
 test "pristine discard refuses a writer from a different Store root" {
@@ -8596,7 +8710,6 @@ test "session store delegates schema v3 authority operations" {
 }
 
 test "schema v3 load repairs duplicate-key tool arguments before gateway projection" {
-    const gateway_json = @import("../gateway/gateway_json.zig");
     const types = @import("../shared/types.zig");
     const alloc = std.testing.allocator;
     const duplicate_arguments = "{\"depth\":1,\"depth\":2}";
@@ -8679,17 +8792,8 @@ test "schema v3 load repairs duplicate-key tool arguments before gateway project
     var messages: std.ArrayList(types.ChatMessage) = .empty;
     try session.appendHistoryChatMessages(arena, &messages, loaded.history);
     try messages.append(arena, .{ .role = .user, .content = "continue" });
-    const body = try gateway_json.buildGatewayRequestBodyWithOptions(
-        alloc,
-        "[]",
-        messages.items,
-        .{},
-        .auto,
-    );
-    defer alloc.free(body);
-    try std.testing.expect(std.mem.find(u8, body, "\"input\":{}") != null);
-    try std.testing.expect(std.mem.find(u8, body, "tool_execution_failed") != null);
-    try std.testing.expect(std.mem.find(u8, body, duplicate_arguments) == null);
+    try std.testing.expectEqualStrings("{}", messages.items[1].tool_calls[0].arguments_json);
+    try std.testing.expect(std.mem.find(u8, messages.items[2].content.?, "tool_execution_failed") != null);
 
     debug_trace.shutdown();
     var trace_file = try std.Io.Dir.openFileAbsolute(io_mod.getIo(), trace_path, .{});

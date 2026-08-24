@@ -3,7 +3,9 @@ const builtin = @import("builtin");
 const question_answer = @import("../agent/question_answer.zig");
 const config_runtime = @import("../config/config_runtime.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
+const model_provider = @import("../config/model_provider.zig");
 const assistant_presentation = @import("../agent/assistant_presentation.zig");
+const tool_admission = @import("../agent/runtime/tool_admission.zig");
 const tool_presentation = @import("../agent/runtime/tool_presentation.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const runtime_profile = @import("../hosts/runtime_profile.zig");
@@ -12,6 +14,7 @@ const host_target = @import("../hosts/target.zig");
 const diff = @import("../output/diff.zig");
 const diagnostics = @import("../workspace/diagnostics.zig");
 const app_lifecycle = @import("app_lifecycle.zig");
+const provider_runtime = @import("provider_runtime.zig");
 const input_completion_runtime = @import("input_completion_runtime.zig");
 const input_queue_runtime = @import("input_queue_runtime.zig");
 const image_attachments = @import("../images/image_attachments.zig");
@@ -30,6 +33,7 @@ const result_store = @import("../session/result_store.zig");
 const command_replay_store = @import("../session/command_replay_store.zig");
 const command_output_content = @import("../tooling/command_output_content.zig");
 const captured_command = @import("../tooling/captured_command.zig");
+const tool_result_errors = @import("../tooling/tool_result_errors.zig");
 const session_display_metadata = @import("../session/session_display_metadata.zig");
 const session_log = @import("../session/session_log.zig");
 const session_resume_view = @import("../session/session_resume_view.zig");
@@ -335,16 +339,22 @@ pub const ResumeHandoff = struct {
 };
 
 pub const SessionPreferencePatch = struct {
+    provider: ?model_provider.ProviderId = null,
     model: ?[]const u8 = null,
     effort: ?types.ReasoningEffort = null,
     fast_mode: ?bool = null,
 
-    fn userSettingsPatch(self: SessionPreferencePatch) config_runtime.UserSettingsPatch {
-        return .{
-            .model = self.model,
+    pub fn userSettingsPatch(self: SessionPreferencePatch) config_runtime.UserSettingsPatch {
+        var patch = config_runtime.UserSettingsPatch{
+            .provider = self.provider,
             .effort = self.effort,
             .fast_mode = self.fast_mode,
         };
+        if (self.model) |model| patch.model_preference = .{
+            .provider = self.provider orelse .gateway,
+            .model = model,
+        };
+        return patch;
     }
 };
 
@@ -368,6 +378,7 @@ pub const SessionPicker = struct {
     has_more: bool = false,
     loading_more: bool = false,
     summaries: std.ArrayList(session_store.SessionSummary) = .empty,
+    continuation: ?subagent_resume_admission.ActionableContinuation = null,
     selected: usize = 0,
     window_start: usize = 0,
     scope: SessionPickerScope = .current_workspace,
@@ -378,6 +389,7 @@ pub const SessionPicker = struct {
     pub fn deinit(self: *SessionPicker, alloc: Allocator) void {
         for (self.summaries.items) |*summary| summary.deinit(alloc);
         self.summaries.deinit(alloc);
+        if (self.continuation) |*continuation| continuation.deinit(alloc);
         self.* = .{};
     }
 
@@ -491,7 +503,7 @@ const SessionPickerPageCache = struct {
     active_id: ?[]u8 = null,
     limit: usize = 0,
     loaded_at_ns: i128 = 0,
-    page: session_store.ResumableSessionPage = .{},
+    page: subagent_resume_admission.ActionableSessionPage = .{},
 
     fn deinit(self: *SessionPickerPageCache) void {
         const alloc = std.heap.c_allocator;
@@ -515,19 +527,32 @@ const SessionPickerPageCache = struct {
 
     fn install(
         self: *SessionPickerPageCache,
-        source: *const session_store.ResumableSessionPage,
+        source: *const subagent_resume_admission.ActionableSessionPage,
         active_id: ?[]const u8,
         limit: usize,
         loaded_at_ns: i128,
     ) !void {
         const alloc = std.heap.c_allocator;
+        var owned_active_id = if (active_id) |id| try alloc.dupe(u8, id) else null;
+        errdefer if (owned_active_id) |id| alloc.free(id);
+        var owned_continuation: ?subagent_resume_admission.ActionableContinuation =
+            if (source.continuation) |continuation| .{
+                .updated_at_ms = continuation.updated_at_ms,
+                .id = try alloc.dupe(u8, continuation.id),
+            } else null;
+        errdefer if (owned_continuation) |*continuation| continuation.deinit(alloc);
         var replacement: SessionPickerPageCache = .{
             .ready = true,
-            .active_id = if (active_id) |id| try alloc.dupe(u8, id) else null,
+            .active_id = owned_active_id,
             .limit = limit,
             .loaded_at_ns = loaded_at_ns,
-            .page = .{ .has_more = source.has_more },
+            .page = .{
+                .has_more = source.has_more,
+                .continuation = owned_continuation,
+            },
         };
+        owned_active_id = null;
+        owned_continuation = null;
         errdefer replacement.deinit();
         for (source.summaries.items) |summary| {
             var copied = try session_summary_codec.cloneSessionSummary(alloc, summary);
@@ -559,7 +584,7 @@ fn sessionPickerCacheForScope(
 fn replaceSessionPickerPage(
     picker: *SessionPicker,
     alloc: Allocator,
-    source: *const session_store.ResumableSessionPage,
+    source: *const subagent_resume_admission.ActionableSessionPage,
 ) !void {
     var replacement: std.ArrayList(session_store.SessionSummary) = .empty;
     errdefer {
@@ -648,7 +673,7 @@ const SessionPickerLoad = struct {
         home_dir: []u8,
         workspace_root: []u8,
         request: PageRequest,
-        page: ?session_store.ResumableSessionPage = null,
+        page: ?subagent_resume_admission.ActionableSessionPage = null,
         failure: ?anyerror = null,
 
         fn deinit(self: *Task) void {
@@ -923,13 +948,18 @@ fn tryListResumableIndexPageForScope(
     active_id: ?[]const u8,
     continuation: ?session_store.ResumableSessionContinuation,
     limit: usize,
-) !?session_store.ResumableSessionPage {
-    var scoped = store;
-    scoped.resume_page_limit = limit;
-    return switch (scope) {
-        .current_workspace => try scoped.tryListResumableWorkspaceIndexPage(alloc, active_id, continuation),
-        .all_workspaces => try scoped.tryListResumableIndexPage(alloc, active_id, continuation),
-    };
+) !?subagent_resume_admission.ActionableSessionPage {
+    return subagent_resume_admission.tryListActionableIndexPage(
+        store,
+        alloc,
+        switch (scope) {
+            .current_workspace => .current_workspace,
+            .all_workspaces => .all_workspaces,
+        },
+        active_id,
+        continuation,
+        limit,
+    );
 }
 
 fn listResumablePageForScope(
@@ -939,13 +969,18 @@ fn listResumablePageForScope(
     active_id: ?[]const u8,
     continuation: ?session_store.ResumableSessionContinuation,
     limit: usize,
-) !session_store.ResumableSessionPage {
-    var scoped = store;
-    scoped.resume_page_limit = limit;
-    return switch (scope) {
-        .current_workspace => try scoped.listResumableWorkspacePage(alloc, active_id, continuation),
-        .all_workspaces => try scoped.listResumablePage(alloc, active_id, continuation),
-    };
+) !subagent_resume_admission.ActionableSessionPage {
+    return subagent_resume_admission.listActionablePage(
+        store,
+        alloc,
+        switch (scope) {
+            .current_workspace => .current_workspace,
+            .all_workspaces => .all_workspaces,
+        },
+        active_id,
+        continuation,
+        limit,
+    );
 }
 
 const default_cancelled_command_replay_inline_limit: usize = 64 * 1024;
@@ -1291,6 +1326,7 @@ pub fn Runtime(comptime App: type) type {
 
         pub fn configureStartupPreferences(
             app: *App,
+            provider: model_provider.ProviderId,
             configured_model: []const u8,
             model_source: config_runtime.ModelSource,
             selected_model: []const u8,
@@ -1301,6 +1337,7 @@ pub fn Runtime(comptime App: type) type {
                 app.alloc,
                 &app.session_persistence.workspace_preferences,
                 .{
+                    .provider = provider,
                     .model = @constCast(configured_model),
                     .effort = effort,
                     .fast_mode = fast_mode,
@@ -1786,14 +1823,20 @@ pub fn Runtime(comptime App: type) type {
         }
 
         pub fn startResumedSessionReconciliation(app: *App) void {
-            if (comptime @hasField(App, "auth")) {
-                if (app.auth.apiKey()) |api_key| {
-                    app.session.usage.startReconciliation(
-                        app.alloc,
-                        api_key,
-                    );
-                }
-            }
+            if (comptime !@hasField(App, "auth") or !provider_runtime.supported(App)) return;
+            if (comptime !@hasDecl(@TypeOf(app.auth), "credentialSource") or
+                !@hasDecl(@TypeOf(app.auth), "accountId") or
+                !@hasDecl(@TypeOf(app.session.usage), "replaceProviderReconciliationCredential")) return;
+
+            const source = app.auth.credentialSource() orelse return;
+            const credential = app.auth.apiKey() orelse return;
+            app.session.usage.replaceProviderReconciliationCredential(
+                app.alloc,
+                provider_runtime.provider(app),
+                source,
+                app.auth.accountId(),
+                credential,
+            );
         }
 
         pub fn resumeSelectedSession(app: *App) !bool {
@@ -1996,6 +2039,13 @@ pub fn Runtime(comptime App: type) type {
             const now_ns = io_mod.nanoTimestamp();
             if (cache.matches(active_id, limit)) {
                 try replaceSessionPickerPage(picker, app.alloc, &cache.page);
+                const continuation: ?subagent_resume_admission.ActionableContinuation =
+                    if (cache.page.continuation) |value| .{
+                        .updated_at_ms = value.updated_at_ms,
+                        .id = try app.alloc.dupe(u8, value.id),
+                    } else null;
+                if (picker.continuation) |*prior| prior.deinit(app.alloc);
+                picker.continuation = continuation;
                 picker.has_more = cache.page.has_more;
                 picker.load_state = .ready;
                 cache_visible = true;
@@ -2184,8 +2234,17 @@ pub fn Runtime(comptime App: type) type {
             app: *App,
             picker: *SessionPicker,
             task: *const SessionPickerLoad.Task,
-            page: *const session_store.ResumableSessionPage,
+            page: *const subagent_resume_admission.ActionableSessionPage,
         ) !void {
+            var continuation: ?subagent_resume_admission.ActionableContinuation =
+                if (page.continuation) |value| .{
+                    .updated_at_ms = value.updated_at_ms,
+                    .id = try app.alloc.dupe(u8, value.id),
+                } else null;
+            errdefer if (continuation) |value| {
+                var owned = value;
+                owned.deinit(app.alloc);
+            };
             const selected_load_more = task.request.continuation != null and
                 picker.selected == picker.filteredItemCount();
             const previous_filtered_count = picker.filteredItemCount();
@@ -2194,6 +2253,9 @@ pub fn Runtime(comptime App: type) type {
             } else {
                 try picker.appendPage(app.alloc, page.summaries.items);
             }
+            if (picker.continuation) |*prior| prior.deinit(app.alloc);
+            picker.continuation = continuation;
+            continuation = null;
             picker.has_more = page.has_more;
             picker.loading_more = false;
             picker.load_state = .ready;
@@ -2221,7 +2283,8 @@ pub fn Runtime(comptime App: type) type {
                 value
             else
                 return error.SessionStoreUnavailable;
-            const last = picker.summaries.items[picker.summaries.items.len - 1];
+            const continuation = picker.continuation orelse
+                return error.SessionStoreUnavailable;
             const active_id = if (app.session_persistence.writable) |*loaded|
                 loaded.active_id
             else
@@ -2234,10 +2297,7 @@ pub fn Runtime(comptime App: type) type {
                 picker.generation,
                 picker.scope,
                 active_id,
-                .{
-                    .updated_at_ms = last.updated_at_ms,
-                    .id = last.id,
-                },
+                continuation.view(),
                 limit,
             );
 
@@ -2853,6 +2913,7 @@ pub fn Runtime(comptime App: type) type {
                         @constCast(model)
                     else
                         null,
+                    .provider = patch.provider,
                     .effort = patch.effort,
                     .fast_mode = patch.fast_mode,
                 } },
@@ -2943,7 +3004,7 @@ pub fn Runtime(comptime App: type) type {
         /// workspace basename. The active model remains visible as secondary
         /// context, including after a model switch.
         pub fn syncTerminalTitle(app: *App) void {
-            if (comptime !@hasField(App, "selected_model")) return;
+            if (comptime !provider_runtime.supported(App)) return;
             syncTerminalTitleWith(app, terminalTitle(app));
         }
 
@@ -2951,7 +3012,7 @@ pub fn Runtime(comptime App: type) type {
             app: *App,
             provider: host_capability.TerminalTitle,
         ) void {
-            if (comptime !@hasField(App, "selected_model")) return;
+            if (comptime !provider_runtime.supported(App)) return;
             var label_buffer: [terminal_title_label_max_bytes]u8 = undefined;
             var writer: std.Io.Writer = .fixed(&label_buffer);
             const primary = cachedSessionTitle(app) orelse workspaceTerminalTitle(app);
@@ -2960,11 +3021,12 @@ pub fn Runtime(comptime App: type) type {
                 primary,
                 terminal_title_primary_max_bytes,
             ) catch return;
-            if (app.selected_model.items.len > 0) {
+            const selected_model = provider_runtime.model(app);
+            if (selected_model.len > 0) {
                 writer.writeAll(terminal_title_separator) catch return;
                 writeBoundedTerminalTitleComponent(
                     &writer,
-                    app.selected_model.items,
+                    selected_model,
                     terminal_title_model_max_bytes,
                 ) catch return;
             }
@@ -3623,7 +3685,7 @@ pub fn Runtime(comptime App: type) type {
                 .upgrade => |version| {
                     const body = try std.fmt.allocPrint(
                         app.alloc,
-                        "𝒇x has been updated to v{s}",
+                        "fx has been updated to v{s}",
                         .{version},
                     );
                     defer app.alloc.free(body);
@@ -3881,6 +3943,7 @@ pub fn Runtime(comptime App: type) type {
             );
             const context_deferred = types.isContextDeferredToolResult(result);
             const deferred = types.isDeferredToolResult(result);
+            const permission_denial_reason = tool_result_errors.toolPermissionDenialReason(result.output);
             const process_ran = result.command_process_presentation != null;
 
             var action_arena = std.heap.ArenaAllocator.init(app.alloc);
@@ -3894,6 +3957,14 @@ pub fn Runtime(comptime App: type) type {
                         types.context_deferred_tool_status_label
                     else
                         types.deferred_tool_result_output,
+                    &.{},
+                )
+            else if (permission_denial_reason) |reason|
+                try app.describeToolActionDeniedWithAdvertised(
+                    action_arena.allocator(),
+                    call,
+                    null,
+                    tool_admission.permissionDeniedStatusLabel(reason),
                     &.{},
                 )
             else if (result.status == .success or process_ran)
@@ -3916,7 +3987,7 @@ pub fn Runtime(comptime App: type) type {
 
             const outcome: types.ToolOutcomeKind = if (context_deferred)
                 .deferred
-            else if (deferred)
+            else if (deferred or permission_denial_reason != null)
                 .denied
             else if (result.status == .success or process_ran)
                 .completed
@@ -3927,7 +3998,7 @@ pub fn Runtime(comptime App: type) type {
                 outcome,
                 action,
             );
-            if (!is_command or deferred) {
+            if (!is_command or deferred or permission_denial_reason != null) {
                 try sink.attachHistoricalToolDetail(entry_id, call, result);
                 return;
             }
@@ -4539,7 +4610,6 @@ pub fn Runtime(comptime App: type) type {
                     .tool_set = app.toolAdvertisementSet(),
                     .mode = .full,
                 },
-                if (comptime @hasField(App, "permission_state")) app.permission_state.sandbox_backend else .none,
                 integrations,
                 if (comptime @hasField(App, "permission_engine")) app.permission_engine.rules else .{},
                 if (comptime @hasField(App, "permission_engine")) app.permission_engine.grants.items else &.{},
@@ -4832,15 +4902,13 @@ pub fn Runtime(comptime App: type) type {
             app: *App,
             preferences: session_codec.DurableSessionPreferences,
         ) !void {
-            app.selected_model.clearRetainingCapacity();
-            try app.selected_model.appendSlice(app.alloc, preferences.model);
+            try provider_runtime.replaceSelection(app, preferences.provider, preferences.model);
             if (app.session_persistence.process_model_override) |model| {
-                app.selected_model.clearRetainingCapacity();
-                try app.selected_model.appendSlice(app.alloc, model);
+                try provider_runtime.replaceModel(app, model);
             }
             try app.worker.syncQueuedPromptModel(
                 std.heap.c_allocator,
-                app.selected_model.items,
+                provider_runtime.model(app),
             );
             app.effort = preferences.effort;
             app.fast_mode = preferences.fast_mode;
@@ -4908,6 +4976,7 @@ fn applyPreferencePatch(
     patch: SessionPreferencePatch,
 ) !void {
     var current = target.* orelse return error.SessionPreferencesUnavailable;
+    if (patch.provider) |provider| current.provider = provider;
     if (patch.model) |model| {
         const replacement = try alloc.dupe(u8, model);
         alloc.free(current.model);
@@ -5142,7 +5211,6 @@ const TestApp = struct {
     permission_engine: permissions.PermissionEngine = .{},
     permission_state: struct {
         authority_mutex: std.Io.Mutex = .init,
-        sandbox_backend: types.BackendKind = .none,
     } = .{},
     mcp_tool_names: std.ArrayList([]u8) = .empty,
 
@@ -5568,6 +5636,7 @@ test "js-host resume restores transcript context preferences usage and revision"
     defer app.deinit();
     try Runtime(TestApp).configureStartupPreferences(
         &app,
+        .gateway,
         "startup/model",
         .user_global,
         "startup/model",
@@ -5623,6 +5692,7 @@ test "js-host resume store failures and missing records fall back to fresh sessi
         defer app.deinit();
         try Runtime(TestApp).configureStartupPreferences(
             &app,
+            .gateway,
             "fresh/model",
             .user_global,
             "fresh/model",
@@ -5651,6 +5721,7 @@ test "js-host picker request stays unsupported and starts fresh" {
     defer app.deinit();
     try Runtime(TestApp).configureStartupPreferences(
         &app,
+        .gateway,
         "fresh/model",
         .user_global,
         "fresh/model",
@@ -5675,6 +5746,7 @@ test "js-host completed and interrupted turns propagate revisions preserve owner
     defer app.deinit();
     try Runtime(TestApp).configureStartupPreferences(
         &app,
+        .gateway,
         "fresh/model",
         .user_global,
         "fresh/model",
@@ -5741,6 +5813,7 @@ test "js-host preference changes snapshot the updated session preferences" {
     defer app.deinit();
     try Runtime(TestApp).configureStartupPreferences(
         &app,
+        .gateway,
         "fresh/model",
         .user_global,
         "fresh/model",
@@ -5835,6 +5908,7 @@ fn testPaths(alloc: Allocator, tmp: *std.testing.TmpDir) !struct { home: []u8, w
 fn configureTestPreferences(app: *TestApp) !void {
     try Runtime(TestApp).configureStartupPreferences(
         app,
+        .gateway,
         "configured/model",
         .user_workspace,
         "configured/model",
@@ -6362,7 +6436,7 @@ test "enableSessionStores replaces existing subagent host without leaking" {
     try std.testing.expect(app.session_persistence.subagent_host != null);
 }
 
-test "interactive subagent host resolves current tools rules grants sandbox and integrations" {
+test "interactive subagent host resolves current tools rules grants and integrations" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -6388,10 +6462,8 @@ test "interactive subagent host resolves current tools rules grants sandbox and 
         root_id,
     );
     defer initial.deinit(alloc);
-    try std.testing.expectEqual(types.BackendKind.none, initial.sandbox_backend);
     try std.testing.expectEqual(@as(usize, 0), initial.integrations.len);
 
-    app.permission_state.sandbox_backend = .vercel;
     try app.permission_engine.allow(alloc, "run_command", "zig build test");
     try app.mcp_tool_names.append(alloc, try alloc.dupe(u8, "mcp_fixture_echo"));
     var changed = try host.host_authority.resolve_fn(
@@ -6400,7 +6472,6 @@ test "interactive subagent host resolves current tools rules grants sandbox and 
         root_id,
     );
     defer changed.deinit(alloc);
-    try std.testing.expectEqual(types.BackendKind.vercel, changed.sandbox_backend);
     try std.testing.expectEqualStrings("mcp_fixture_echo", changed.integrations[0]);
     try std.testing.expectEqualStrings("zig build test", changed.grants[0].target_path);
     try std.testing.expect(initial.generation != changed.generation);
@@ -6500,6 +6571,83 @@ test "execution replay renders persisted permission feedback after its tool resu
     try std.testing.expectEqual(@as(usize, 1), app.cards.items.len);
     try std.testing.expectEqualStrings("Then read the file and report its exact contents.", app.cards.items[0].text);
     try std.testing.expect(app.cards.items[0].has_prior_turns);
+}
+
+test "execution replay preserves permission denial reasons" {
+    const alloc = std.testing.allocator;
+    var app = try TestApp.init(alloc, "/workspace");
+    defer app.deinit();
+
+    const reasons = [_]types.ToolPermissionDenialReason{
+        .user_denied,
+        .auto_denied,
+        .policy_denied,
+        .permission_required,
+        .review_caution,
+        .review_unavailable,
+    };
+    const call_ids = [_][]const u8{
+        "call_user_denied",
+        "call_auto_denied",
+        "call_policy_denied",
+        "call_permission_required",
+        "call_review_caution",
+        "call_review_unavailable",
+    };
+    var outputs: [reasons.len][]u8 = undefined;
+    var allocated_outputs: usize = 0;
+    defer for (outputs[0..allocated_outputs]) |output| alloc.free(output);
+    var calls: [reasons.len]types.ToolCall = undefined;
+    var results: [reasons.len]types.PersistedToolResult = undefined;
+    for (reasons, 0..) |reason, index| {
+        outputs[index] = switch (reason) {
+            .review_caution, .review_unavailable => try tool_result_errors.toolReviewHeldJson(
+                alloc,
+                "run_command",
+                reason,
+                null,
+            ),
+            .user_denied, .auto_denied, .policy_denied, .permission_required => try tool_result_errors.toolPermissionDeniedJson(
+                alloc,
+                "run_command",
+                reason,
+            ),
+        };
+        allocated_outputs += 1;
+        calls[index] = .{
+            .id = call_ids[index],
+            .name = "run_command",
+            .arguments_json = "{\"command\":\"pwd\"}",
+        };
+        results[index] = .{
+            .tool_call_id = @constCast(call_ids[index]),
+            .tool_name = @constCast("run_command"),
+            .status = .failure,
+            .output = outputs[index],
+            .output_bytes = outputs[index].len,
+            .stored_output_bytes = outputs[index].len,
+        };
+    }
+    var steps = [_]types.ToolExecutionStep{.{
+        .tool_calls = calls[0..],
+        .tool_results = results[0..],
+    }};
+
+    try Runtime(TestApp).writeExecutionHistory(&app, .{ .tool_steps = steps[0..] });
+
+    try std.testing.expectEqualSlices(
+        types.ToolOutcomeKind,
+        &.{ .denied, .denied, .denied, .denied, .denied, .denied },
+        app.completed_tool_outcomes.items,
+    );
+    try std.testing.expectEqual(@as(usize, 6), app.completed_tool_statuses.items.len);
+    try std.testing.expectEqualStrings("● Denied run_command\n", app.completed_tool_statuses.items[0]);
+    try std.testing.expectEqualStrings("● Denied by auto agent run_command\n", app.completed_tool_statuses.items[1]);
+    try std.testing.expectEqualStrings("● Denied run_command\n", app.completed_tool_statuses.items[2]);
+    try std.testing.expectEqualStrings("● Permission required run_command\n", app.completed_tool_statuses.items[3]);
+    try std.testing.expectEqualStrings("● Safety caution run_command\n", app.completed_tool_statuses.items[4]);
+    try std.testing.expectEqualStrings("● Review unavailable run_command\n", app.completed_tool_statuses.items[5]);
+    try std.testing.expectEqual(@as(usize, 0), app.transcript.items.len);
 }
 
 test "execution replay writes completed status before saved command output" {
@@ -7270,6 +7418,7 @@ test "upgrade resume restores active session with the installed version notice" 
     try configureTestPreferences(&app);
     try Runtime(TestApp).configureStartupPreferences(
         &app,
+        .gateway,
         "configured/model",
         .process_override,
         "env/model",
@@ -7360,7 +7509,7 @@ test "upgrade resume restores active session with the installed version notice" 
     try std.testing.expectEqualStrings("inspect file", context[1].assistant.user.text);
     try std.testing.expectEqualStrings("run server", context[2].background_command.user.text);
     try std.testing.expectEqual(@as(usize, 3), app.notices.items.len);
-    try std.testing.expectEqualStrings("● 𝒇x has been updated to v9.9.9", app.notices.items[0]);
+    try std.testing.expectEqualStrings("● fx has been updated to v9.9.9", app.notices.items[0]);
     try std.testing.expect(std.mem.find(u8, app.notices.items[1], "older context") != null);
     try std.testing.expect(std.mem.find(u8, app.notices.items[2], "Re-check runtime context") != null);
     try std.testing.expectEqual(@as(usize, 2), app.completed_tool_statuses.items.len);
@@ -7431,7 +7580,7 @@ test "resumed recovery checkpoint replays its unfinished turn once" {
             .assistant_source = @constCast("Partial output before EOF."),
             .cause = .response_interrupted,
             .action = .continuing_response,
-            .route_model = @constCast("saved/model"),
+            .authority = .{ .provider = .gateway, .model = @constCast("saved/model") },
             .requested_fast_mode = false,
             .fast_mode = false,
             .max_provider_attempts = 10,
@@ -8746,6 +8895,7 @@ test "fresh interactive session retains one writable schema-v3 handle" {
 
     try Runtime(TestApp).configureStartupPreferences(
         &app,
+        .gateway,
         "configured/model",
         .user_workspace,
         "configured/model",
@@ -8854,10 +9004,10 @@ test "combined preference patch writes user defaults cleans legacy fields and ap
 
     var detailed = try config_runtime.loadMergedSettingsDetailed(alloc, paths.workspace);
     defer detailed.deinit(alloc);
-    try std.testing.expectEqualStrings("user/model", detailed.settings.model.?);
+    try std.testing.expectEqualStrings("user/model", detailed.settings.models.get(.gateway).?);
     try std.testing.expectEqual(types.ReasoningEffort.literal("high"), detailed.settings.effort.?);
     try std.testing.expectEqual(false, detailed.settings.fast_mode.?);
-    try std.testing.expectEqual(config_runtime.ConfigSource.user_global, detailed.sources.model);
+    try std.testing.expectEqual(config_runtime.ConfigSource.user_global, detailed.sources.models.get(.gateway));
     try std.testing.expectEqual(config_runtime.ConfigSource.user_global, detailed.sources.effort);
     try std.testing.expectEqual(config_runtime.ConfigSource.user_global, detailed.sources.fast_mode);
 }
@@ -9045,8 +9195,8 @@ test "session picker rejects a load more completion after switching to a fresh c
     try Runtime(TestApp).initializePersistence(&app, true);
     try Runtime(TestApp).beginFreshPersistedSession(&app);
 
-    const current_page: session_store.ResumableSessionPage = .{};
-    var all_page: session_store.ResumableSessionPage = .{ .has_more = true };
+    const current_page: subagent_resume_admission.ActionableSessionPage = .{};
+    var all_page: subagent_resume_admission.ActionableSessionPage = .{ .has_more = true };
     defer all_page.deinit(alloc);
     try all_page.summaries.append(alloc, .{
         .id = try alloc.dupe(u8, "foreign-session"),
@@ -9472,7 +9622,7 @@ test "session picker keeps stale cached rows ready when refresh fails" {
     try Runtime(TestApp).initializePersistence(&app, true);
     try Runtime(TestApp).beginFreshPersistedSession(&app);
 
-    var cached_page: session_store.ResumableSessionPage = .{};
+    var cached_page: subagent_resume_admission.ActionableSessionPage = .{};
     defer cached_page.deinit(alloc);
     try cached_page.summaries.append(alloc, .{
         .id = try alloc.dupe(u8, "cached-session"),
@@ -9691,6 +9841,69 @@ test "renameActiveSession persists the title to the sidecar and session index" {
     defer display.deinit(alloc);
     try std.testing.expect(display.present);
     try std.testing.expectEqualStrings("deploy pipeline fix", display.title);
+}
+
+const ReconciliationOriginUsage = struct {
+    replaced_provider: ?model_provider.ProviderId = null,
+    replaced_source: ?types.CredentialSource = null,
+
+    fn replaceProviderReconciliationCredential(
+        self: *@This(),
+        _: Allocator,
+        provider: model_provider.ProviderId,
+        source: types.CredentialSource,
+        _: ?[]const u8,
+        _: []const u8,
+    ) void {
+        self.replaced_provider = provider;
+        self.replaced_source = source;
+    }
+};
+
+const ReconciliationOriginAuth = struct {
+    source: types.CredentialSource,
+
+    fn credentialSource(self: *const @This()) ?types.CredentialSource {
+        return self.source;
+    }
+
+    fn apiKey(_: *const @This()) ?[]const u8 {
+        return "origin-bound-token";
+    }
+
+    fn accountId(_: *const @This()) ?[]const u8 {
+        return null;
+    }
+
+    fn gatewayTeam(_: *const @This()) ?[]const u8 {
+        return null;
+    }
+};
+
+const ReconciliationOriginApp = struct {
+    alloc: Allocator = std.testing.allocator,
+    auth: ReconciliationOriginAuth,
+    session: struct { usage: ReconciliationOriginUsage = .{} } = .{},
+    selected_provider: model_provider.ProviderId,
+    selected_model: std.ArrayList(u8) = .empty,
+};
+
+test "resumed sessions install provider-scoped usage reconciliation authority" {
+    var chatgpt = ReconciliationOriginApp{
+        .auth = .{ .source = .chatgpt_subscription },
+        .selected_provider = .codex,
+    };
+    Runtime(ReconciliationOriginApp).startResumedSessionReconciliation(&chatgpt);
+    try std.testing.expectEqual(model_provider.ProviderId.codex, chatgpt.session.usage.replaced_provider.?);
+    try std.testing.expectEqual(types.CredentialSource.chatgpt_subscription, chatgpt.session.usage.replaced_source.?);
+
+    var gateway = ReconciliationOriginApp{
+        .auth = .{ .source = .ai_gateway_api_key },
+        .selected_provider = .gateway,
+    };
+    Runtime(ReconciliationOriginApp).startResumedSessionReconciliation(&gateway);
+    try std.testing.expectEqual(model_provider.ProviderId.gateway, gateway.session.usage.replaced_provider.?);
+    try std.testing.expectEqual(types.CredentialSource.ai_gateway_api_key, gateway.session.usage.replaced_source.?);
 }
 
 test "ensureCachedSessionTitle derives from the first prompt and then freezes" {

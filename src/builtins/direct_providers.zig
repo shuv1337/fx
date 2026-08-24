@@ -4,6 +4,7 @@ const stream_provider = @import("../core/agent/stream_provider.zig");
 const secret = @import("../core/auth/secret.zig");
 const io_mod = @import("../core/shared/io.zig");
 const types = @import("../core/shared/types.zig");
+const model_tool_schema = @import("../core/tooling/model_tool_schema.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -28,7 +29,6 @@ const DirectModel = struct {
 };
 
 pub const agent_stream_provider = stream_provider.Provider{
-    .build_fn = build,
     .stream_fn = stream,
 };
 
@@ -50,7 +50,7 @@ fn directModel(model: []const u8) ?DirectModel {
     return null;
 }
 
-fn build(_: ?*anyopaque, alloc: Allocator, request: stream_provider.BuildRequest) anyerror![]u8 {
+fn build(alloc: Allocator, request: stream_provider.RequestData) anyerror![]u8 {
     const direct = directModel(request.model) orelse return error.AgentStreamProviderUnavailable;
     try checkBuildBudget(request.budget);
     if (request.verified_images != null or request.response_format != null) {
@@ -71,7 +71,7 @@ fn checkBuildBudget(budget: ?stream_provider.BuildBudget) !void {
     }
 }
 
-fn buildAnthropicRequest(alloc: Allocator, wire_model: []const u8, request: stream_provider.BuildRequest) ![]u8 {
+fn buildAnthropicRequest(alloc: Allocator, wire_model: []const u8, request: stream_provider.RequestData) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
     const writer = &out.writer;
@@ -99,7 +99,7 @@ fn buildAnthropicRequest(alloc: Allocator, wire_model: []const u8, request: stre
         try writeAnthropicMessage(writer, message);
     }
     try writer.writeByte(']');
-    try writeAnthropicTools(alloc, writer, request.serialized_tools, request.tool_choice);
+    try writeAnthropicTools(alloc, writer, request.tools, request.tool_choice);
     if (request.provider_options.reasoning) |*effort| {
         try writer.writeAll(",\"thinking\":{\"type\":\"adaptive\"},\"output_config\":{\"effort\":");
         try writeJson(writer, effort.label());
@@ -152,39 +152,57 @@ fn writeAnthropicMessage(writer: *std.Io.Writer, message: types.ChatMessage) !vo
     try writer.writeAll("]}");
 }
 
-fn writeAnthropicTools(alloc: Allocator, writer: *std.Io.Writer, tools_json: []const u8, choice: types.ToolChoice) !void {
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, tools_json, .{});
-    defer parsed.deinit();
-    if (parsed.value != .array or parsed.value.array.items.len == 0) return;
-
-    var function_count: usize = 0;
-    for (parsed.value.array.items) |tool| {
-        if (!isUnsupportedDirectTool(tool)) function_count += 1;
-    }
+fn writeAnthropicTools(alloc: Allocator, writer: *std.Io.Writer, tools: stream_provider.ToolSelection, choice: types.ToolChoice) !void {
+    const function_count = directToolCount(tools);
     if (function_count == 0) return;
 
     try writer.writeAll(",\"tools\":[");
     var first = true;
-    for (parsed.value.array.items) |tool| {
-        if (isUnsupportedDirectTool(tool)) continue;
-        if (!first) try writer.writeByte(',');
-        first = false;
-        const object = if (tool == .object) tool.object else return error.InvalidDirectToolSchema;
-        try writer.writeAll("{\"name\":");
-        try writeJsonValue(writer, object.get("name") orelse return error.InvalidDirectToolSchema);
-        if (object.get("description")) |description| {
-            try writer.writeAll(",\"description\":");
-            try writeJsonValue(writer, description);
-        }
-        try writer.writeAll(",\"input_schema\":");
-        try writeJsonValue(writer, object.get("inputSchema") orelse object.get("parameters") orelse return error.InvalidDirectToolSchema);
-        try writer.writeByte('}');
+    for (tools.advertised_names) |name| {
+        if (std.mem.eql(u8, name, "vision")) continue;
+        const tool = tools.advertisedFunction(name) orelse continue;
+        try writeAnthropicTool(alloc, writer, tool.name, tool.description, .{ .static = tool.input_schema }, &first);
+    }
+    for (tools.additional_functions) |tool| {
+        if (containsToolName(tools.advertised_names, tool.name) or std.mem.eql(u8, tool.name, "vision")) continue;
+        try writeAnthropicTool(alloc, writer, tool.name, tool.description, .{ .static = tool.input_schema }, &first);
+    }
+    for (tools.selected_dynamic) |tool| {
+        if (containsToolName(tools.advertised_names, tool.name) or std.mem.eql(u8, tool.name, "vision")) continue;
+        try writeAnthropicTool(alloc, writer, tool.name, tool.description, .{ .dynamic = tool.input_schema }, &first);
     }
     try writer.writeByte(']');
     try writer.writeAll(if (choice == .none) ",\"tool_choice\":{\"type\":\"none\"}" else ",\"tool_choice\":{\"type\":\"auto\"}");
 }
 
-fn buildResponsesRequest(alloc: Allocator, direct: DirectModel, request: stream_provider.BuildRequest) ![]u8 {
+const ToolInputSchema = union(enum) {
+    static: model_tool_schema.ObjectSchema,
+    dynamic: std.json.Value,
+};
+
+fn writeAnthropicTool(
+    alloc: Allocator,
+    writer: *std.Io.Writer,
+    name: []const u8,
+    description: []const u8,
+    input_schema: ToolInputSchema,
+    first: *bool,
+) !void {
+    if (!first.*) try writer.writeByte(',');
+    first.* = false;
+    try writer.writeAll("{\"name\":");
+    try writeJson(writer, name);
+    try writer.writeAll(",\"description\":");
+    try model_tool_schema.writeCappedDescriptionJsonString(alloc, writer, description);
+    try writer.writeAll(",\"input_schema\":");
+    switch (input_schema) {
+        .static => |schema| try model_tool_schema.writeObjectSchema(alloc, writer, schema),
+        .dynamic => |schema| try writeJsonValue(writer, schema),
+    }
+    try writer.writeByte('}');
+}
+
+fn buildResponsesRequest(alloc: Allocator, direct: DirectModel, request: stream_provider.RequestData) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
     const writer = &out.writer;
@@ -249,7 +267,7 @@ fn buildResponsesRequest(alloc: Allocator, direct: DirectModel, request: stream_
         }
     }
     try writer.writeByte(']');
-    const wrote_tool_choice = try writeResponsesTools(alloc, writer, request.serialized_tools, request.tool_choice);
+    const wrote_tool_choice = try writeResponsesTools(alloc, writer, request.tools, request.tool_choice);
     if (direct.family == .codex) {
         try writer.writeAll(",\"text\":{\"verbosity\":\"low\"},\"include\":[\"reasoning.encrypted_content\"]");
         if (!wrote_tool_choice) {
@@ -270,46 +288,68 @@ fn buildResponsesRequest(alloc: Allocator, direct: DirectModel, request: stream_
     return out.toOwnedSlice();
 }
 
-fn writeResponsesTools(alloc: Allocator, writer: *std.Io.Writer, tools_json: []const u8, choice: types.ToolChoice) !bool {
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, tools_json, .{});
-    defer parsed.deinit();
-    if (parsed.value != .array or parsed.value.array.items.len == 0) return false;
-
-    var function_count: usize = 0;
-    for (parsed.value.array.items) |tool| {
-        if (!isUnsupportedDirectTool(tool)) function_count += 1;
-    }
+fn writeResponsesTools(alloc: Allocator, writer: *std.Io.Writer, tools: stream_provider.ToolSelection, choice: types.ToolChoice) !bool {
+    const function_count = directToolCount(tools);
     if (function_count == 0) return false;
 
     try writer.writeAll(",\"tools\":[");
     var first = true;
-    for (parsed.value.array.items) |tool| {
-        if (isUnsupportedDirectTool(tool)) continue;
-        if (!first) try writer.writeByte(',');
-        first = false;
-        const object = if (tool == .object) tool.object else return error.InvalidDirectToolSchema;
-        try writer.writeAll("{\"type\":\"function\",\"name\":");
-        try writeJsonValue(writer, object.get("name") orelse return error.InvalidDirectToolSchema);
-        if (object.get("description")) |description| {
-            try writer.writeAll(",\"description\":");
-            try writeJsonValue(writer, description);
-        }
-        try writer.writeAll(",\"parameters\":");
-        try writeJsonValue(writer, object.get("inputSchema") orelse object.get("parameters") orelse return error.InvalidDirectToolSchema);
-        try writer.writeByte('}');
+    for (tools.advertised_names) |name| {
+        if (std.mem.eql(u8, name, "vision")) continue;
+        const tool = tools.advertisedFunction(name) orelse continue;
+        try writeResponsesTool(alloc, writer, tool.name, tool.description, .{ .static = tool.input_schema }, &first);
+    }
+    for (tools.additional_functions) |tool| {
+        if (containsToolName(tools.advertised_names, tool.name) or std.mem.eql(u8, tool.name, "vision")) continue;
+        try writeResponsesTool(alloc, writer, tool.name, tool.description, .{ .static = tool.input_schema }, &first);
+    }
+    for (tools.selected_dynamic) |tool| {
+        if (containsToolName(tools.advertised_names, tool.name) or std.mem.eql(u8, tool.name, "vision")) continue;
+        try writeResponsesTool(alloc, writer, tool.name, tool.description, .{ .dynamic = tool.input_schema }, &first);
     }
     try writer.writeAll("],\"tool_choice\":");
     try writeJson(writer, choice.label());
     return true;
 }
 
-fn isUnsupportedDirectTool(tool: std.json.Value) bool {
-    if (jsonString(tool, "type")) |kind| {
-        if (std.mem.eql(u8, kind, "provider")) return true;
+fn writeResponsesTool(
+    alloc: Allocator,
+    writer: *std.Io.Writer,
+    name: []const u8,
+    description: []const u8,
+    input_schema: ToolInputSchema,
+    first: *bool,
+) !void {
+    if (!first.*) try writer.writeByte(',');
+    first.* = false;
+    try writer.writeAll("{\"type\":\"function\",\"name\":");
+    try writeJson(writer, name);
+    try writer.writeAll(",\"description\":");
+    try model_tool_schema.writeCappedDescriptionJsonString(alloc, writer, description);
+    try writer.writeAll(",\"parameters\":");
+    switch (input_schema) {
+        .static => |schema| try model_tool_schema.writeObjectSchema(alloc, writer, schema),
+        .dynamic => |schema| try writeJsonValue(writer, schema),
     }
-    if (jsonString(tool, "name")) |name| {
-        if (std.mem.eql(u8, name, "vision")) return true;
+    try writer.writeByte('}');
+}
+
+fn directToolCount(tools: stream_provider.ToolSelection) usize {
+    var count: usize = 0;
+    for (tools.advertised_names) |name| {
+        if (!std.mem.eql(u8, name, "vision") and tools.advertisedFunction(name) != null) count += 1;
     }
+    for (tools.additional_functions) |tool| {
+        if (!containsToolName(tools.advertised_names, tool.name) and !std.mem.eql(u8, tool.name, "vision")) count += 1;
+    }
+    for (tools.selected_dynamic) |tool| {
+        if (!containsToolName(tools.advertised_names, tool.name) and !std.mem.eql(u8, tool.name, "vision")) count += 1;
+    }
+    return count;
+}
+
+fn containsToolName(names: []const []const u8, needle: []const u8) bool {
+    for (names) |name| if (std.mem.eql(u8, name, needle)) return true;
     return false;
 }
 
@@ -321,11 +361,13 @@ fn writeJsonValue(writer: *std.Io.Writer, value: std.json.Value) !void {
     try std.json.Stringify.value(value, .{}, writer);
 }
 
-fn stream(_: ?*anyopaque, alloc: Allocator, request: stream_provider.Request) anyerror!stream_provider.Result {
+fn stream(_: ?*anyopaque, alloc: Allocator, request: stream_provider.ModelRequest) anyerror!stream_provider.Result {
     const direct = directModel(request.model) orelse return error.AgentStreamProviderUnavailable;
     if (request.cancel_flag.load(.seq_cst)) return error.Cancelled;
+    const payload = try build(alloc, request.data());
+    defer alloc.free(payload);
 
-    const endpoint = if (direct.family == .anthropic and std.mem.startsWith(u8, request.api_key, "sk-ant-oat"))
+    const endpoint = if (direct.family == .anthropic and std.mem.startsWith(u8, request.credential.secret, "sk-ant-oat"))
         anthropic_url ++ "?beta=true"
     else
         direct.endpoint;
@@ -333,7 +375,7 @@ fn stream(_: ?*anyopaque, alloc: Allocator, request: stream_provider.Request) an
     var client: std.http.Client = .{ .allocator = alloc, .io = io_mod.getIo() };
     defer client.deinit();
 
-    const auth = try std.fmt.allocPrint(alloc, "Bearer {s}", .{request.api_key});
+    const auth = try std.fmt.allocPrint(alloc, "Bearer {s}", .{request.credential.secret});
     defer {
         @memset(auth, 0);
         alloc.free(auth);
@@ -346,11 +388,13 @@ fn stream(_: ?*anyopaque, alloc: Allocator, request: stream_provider.Request) an
         alloc.free(@constCast(account_id));
     };
 
+    try request.admission.admit();
+    request.attempt_evidence.provider_admitted = true;
     var req = try client.request(.POST, uri, .{
         .headers = .{
             .content_type = .{ .override = "application/json" },
             .accept_encoding = .omit,
-            .authorization = if (direct.family == .anthropic and !std.mem.startsWith(u8, request.api_key, "sk-ant-oat")) .omit else .{ .override = auth },
+            .authorization = if (direct.family == .anthropic and !std.mem.startsWith(u8, request.credential.secret, "sk-ant-oat")) .omit else .{ .override = auth },
             .user_agent = .{ .override = if (direct.family == .anthropic) "claude-cli/2.1.76 (external, cli)" else "fx" },
         },
         .extra_headers = extra_headers,
@@ -359,11 +403,11 @@ fn stream(_: ?*anyopaque, alloc: Allocator, request: stream_provider.Request) an
     });
     defer req.deinit();
 
-    req.transfer_encoding = .{ .content_length = request.payload.len };
+    req.transfer_encoding = .{ .content_length = payload.len };
     var send_buf: [8192]u8 = undefined;
     request.delivery.markPossiblySent();
     var body_writer = try req.sendBodyUnflushed(&send_buf);
-    try body_writer.writer.writeAll(request.payload);
+    try body_writer.writer.writeAll(payload);
     try body_writer.end();
     if (req.connection) |connection| try connection.flush();
     var response = try req.receiveHead(&.{});
@@ -372,7 +416,11 @@ fn stream(_: ?*anyopaque, alloc: Allocator, request: stream_provider.Request) an
         var transfer_buf: [4096]u8 = undefined;
         const reader = response.reader(&transfer_buf);
         const body = reader.allocRemaining(alloc, .limited(max_error_body_bytes)) catch null;
-        return .{ .status = response.head.status, .err_body = body, .ownership = .owned };
+        return .{ .failed = .{
+            .kind = failureKind(response.head.status),
+            .detail = body,
+            .ownership = .owned,
+        } };
     }
 
     var transfer_buf: [16 * 1024]u8 = undefined;
@@ -381,22 +429,37 @@ fn stream(_: ?*anyopaque, alloc: Allocator, request: stream_provider.Request) an
         alloc,
         reader,
         direct.family,
-        request.callback_ctx,
-        request.on_content_chunk,
-        request.on_tool_start,
-        request.on_reasoning_chunk,
-        request.on_tool_input_chunk,
+        request.events,
         request.cancel_flag,
         request.content_capture_limit,
     );
-    return .{ .status = .ok, .completion = completion, .ownership = .owned };
+    return .{ .completed = .{
+        .completion = completion,
+        .usage = .{ .immediate = null },
+        .ownership = .owned,
+    } };
+}
+
+fn failureKind(status: std.http.Status) stream_provider.FailureKind {
+    return switch (status) {
+        .bad_request => .invalid_request,
+        .unauthorized => .unauthorized,
+        .forbidden => .forbidden,
+        .payload_too_large => .request_too_large,
+        .too_many_requests => .rate_limited,
+        .internal_server_error => .server_error,
+        .bad_gateway => .bad_gateway,
+        .service_unavailable => .unavailable,
+        .gateway_timeout => .gateway_timeout,
+        else => .provider_error,
+    };
 }
 
 fn directHeaders(
     alloc: Allocator,
     buf: []std.http.Header,
     family: Family,
-    request: stream_provider.Request,
+    request: stream_provider.ModelRequest,
     auth: []const u8,
 ) ![]const std.http.Header {
     var len: usize = 0;
@@ -411,7 +474,7 @@ fn directHeaders(
             len += 1;
             buf[len] = .{ .name = "anthropic-dangerous-direct-browser-access", .value = "true" };
             len += 1;
-            if (std.mem.startsWith(u8, request.api_key, "sk-ant-oat")) {
+            if (std.mem.startsWith(u8, request.credential.secret, "sk-ant-oat")) {
                 buf[len] = .{ .name = "anthropic-beta", .value = "claude-code-20250219,oauth-2025-04-20" };
                 len += 1;
                 buf[len] = .{ .name = "x-app", .value = "cli" };
@@ -421,12 +484,15 @@ fn directHeaders(
                     len += 1;
                 };
             } else {
-                buf[len] = .{ .name = "x-api-key", .value = request.api_key };
+                buf[len] = .{ .name = "x-api-key", .value = request.credential.secret };
                 len += 1;
             }
         },
         .codex => {
-            const account_id = try resolveCodexAccountId(alloc, request.api_key);
+            const account_id = if (request.credential.account_id) |account_id|
+                try alloc.dupe(u8, account_id)
+            else
+                try resolveCodexAccountId(alloc, request.credential.secret);
             errdefer alloc.free(account_id);
             buf[len] = .{ .name = "chatgpt-account-id", .value = account_id };
             len += 1;
@@ -517,14 +583,10 @@ fn consumeDirectSse(
     alloc: Allocator,
     reader: *std.Io.Reader,
     family: Family,
-    callback_ctx: *anyopaque,
-    on_content_chunk: stream_provider.StreamCallback,
-    on_tool_start: ?stream_provider.ToolStartCallback,
-    on_reasoning_chunk: ?stream_provider.StreamCallback,
-    on_tool_input_chunk: ?stream_provider.StreamCallback,
+    events: stream_provider.EventSink,
     cancel_flag: *std.atomic.Value(bool),
     content_capture_limit: ?usize,
-) !types.GatewayCompletion {
+) !types.ModelCompletion {
     var content: std.ArrayList(u8) = .empty;
     defer content.deinit(alloc);
     var tools: std.ArrayList(ToolAccumulator) = .empty;
@@ -548,13 +610,13 @@ fn consumeDirectSse(
         defer parsed.deinit();
         if (parsed.value != .object) continue;
         switch (family) {
-            .anthropic => try consumeAnthropicEvent(alloc, parsed.value, &content, &tools, &usage, &finish_reason, callback_ctx, on_content_chunk, on_tool_start, on_reasoning_chunk, on_tool_input_chunk, content_capture_limit),
-            .codex, .xai => try consumeResponsesEvent(alloc, parsed.value, &content, &tools, &usage, &finish_reason, callback_ctx, on_content_chunk, on_tool_start, on_reasoning_chunk, on_tool_input_chunk, content_capture_limit),
+            .anthropic => try consumeAnthropicEvent(alloc, parsed.value, &content, &tools, &usage, &finish_reason, events, content_capture_limit),
+            .codex, .xai => try consumeResponsesEvent(alloc, parsed.value, &content, &tools, &usage, &finish_reason, events, content_capture_limit),
         }
     }
     if (cancel_flag.load(.seq_cst)) return error.Cancelled;
 
-    var completion: types.GatewayCompletion = .{ .usage = usage, .finish_reason = finish_reason };
+    var completion: types.ModelCompletion = .{ .usage = usage, .finish_reason = finish_reason };
     errdefer freeCompletion(alloc, &completion);
     if (content.items.len > 0) completion.content = try alloc.dupe(u8, content.items);
     const tool_calls = try alloc.alloc(types.ToolCall, tools.items.len);
@@ -612,11 +674,7 @@ fn consumeAnthropicEvent(
     tools: *std.ArrayList(ToolAccumulator),
     usage: *types.Usage,
     finish_reason: *?types.ProviderFinishReason,
-    callback_ctx: *anyopaque,
-    on_content_chunk: stream_provider.StreamCallback,
-    on_tool_start: ?stream_provider.ToolStartCallback,
-    on_reasoning_chunk: ?stream_provider.StreamCallback,
-    on_tool_input_chunk: ?stream_provider.StreamCallback,
+    events: stream_provider.EventSink,
     content_capture_limit: ?usize,
 ) !void {
     const event_type = jsonString(root, "type") orelse return;
@@ -639,20 +697,20 @@ fn consumeAnthropicEvent(
             if (input == .object and input.object.count() > 0) try appendJsonValue(alloc, &tool.arguments, input);
         }
         try tools.append(alloc, tool);
-        if (on_tool_start) |callback| callback(callback_ctx, tool.id.items, tool.name.items, null);
+        events.emit(.{ .tool_started = .{ .id = tool.id.items, .name = tool.name.items } });
         return;
     }
     if (std.mem.eql(u8, event_type, "content_block_delta")) {
         const delta = jsonObject(root, "delta") orelse return;
         const delta_type = jsonString(delta, "type") orelse return;
         if (std.mem.eql(u8, delta_type, "text_delta")) {
-            if (jsonString(delta, "text")) |text| try emitContent(alloc, content, text, callback_ctx, on_content_chunk, content_capture_limit);
+            if (jsonString(delta, "text")) |text| try emitContent(alloc, content, text, events, content_capture_limit);
         } else if (std.mem.eql(u8, delta_type, "thinking_delta")) {
-            if (on_reasoning_chunk) |callback| if (jsonString(delta, "thinking")) |thinking| callback(callback_ctx, thinking);
+            if (jsonString(delta, "thinking")) |thinking| events.emit(.{ .reasoning_delta = thinking });
         } else if (std.mem.eql(u8, delta_type, "input_json_delta") and tools.items.len > 0) {
             if (jsonString(delta, "partial_json")) |partial| {
                 try tools.items[tools.items.len - 1].arguments.appendSlice(alloc, partial);
-                if (on_tool_input_chunk) |callback| callback(callback_ctx, partial);
+                events.emit(.{ .tool_input_delta = partial });
             }
         }
         return;
@@ -670,20 +728,16 @@ fn consumeResponsesEvent(
     tools: *std.ArrayList(ToolAccumulator),
     usage: *types.Usage,
     finish_reason: *?types.ProviderFinishReason,
-    callback_ctx: *anyopaque,
-    on_content_chunk: stream_provider.StreamCallback,
-    on_tool_start: ?stream_provider.ToolStartCallback,
-    on_reasoning_chunk: ?stream_provider.StreamCallback,
-    on_tool_input_chunk: ?stream_provider.StreamCallback,
+    events: stream_provider.EventSink,
     content_capture_limit: ?usize,
 ) !void {
     const event_type = jsonString(root, "type") orelse return;
     if (std.mem.eql(u8, event_type, "response.output_text.delta")) {
-        if (jsonString(root, "delta")) |delta| try emitContent(alloc, content, delta, callback_ctx, on_content_chunk, content_capture_limit);
+        if (jsonString(root, "delta")) |delta| try emitContent(alloc, content, delta, events, content_capture_limit);
         return;
     }
     if (std.mem.eql(u8, event_type, "response.reasoning_summary_text.delta")) {
-        if (on_reasoning_chunk) |callback| if (jsonString(root, "delta")) |delta| callback(callback_ctx, delta);
+        if (jsonString(root, "delta")) |delta| events.emit(.{ .reasoning_delta = delta });
         return;
     }
     if (std.mem.eql(u8, event_type, "response.output_item.added")) {
@@ -696,7 +750,7 @@ fn consumeResponsesEvent(
         try tool.name.appendSlice(alloc, jsonString(item, "name") orelse "");
         if (jsonString(item, "arguments")) |arguments| try tool.arguments.appendSlice(alloc, arguments);
         try tools.append(alloc, tool);
-        if (on_tool_start) |callback| callback(callback_ctx, tool.id.items, tool.name.items, null);
+        events.emit(.{ .tool_started = .{ .id = tool.id.items, .name = tool.name.items } });
         return;
     }
     if (std.mem.eql(u8, event_type, "response.function_call_arguments.delta")) {
@@ -704,7 +758,7 @@ fn consumeResponsesEvent(
         const delta = jsonString(root, "delta") orelse return;
         if (findTool(tools.items, id)) |tool| {
             try tool.arguments.appendSlice(alloc, delta);
-            if (on_tool_input_chunk) |callback| callback(callback_ctx, delta);
+            events.emit(.{ .tool_input_delta = delta });
         }
         return;
     }
@@ -730,10 +784,10 @@ fn consumeResponsesEvent(
     if (std.mem.eql(u8, event_type, "response.failed")) finish_reason.* = .provider_error;
 }
 
-fn emitContent(alloc: Allocator, content: *std.ArrayList(u8), delta: []const u8, ctx: *anyopaque, callback: stream_provider.StreamCallback, limit: ?usize) !void {
+fn emitContent(alloc: Allocator, content: *std.ArrayList(u8), delta: []const u8, events: stream_provider.EventSink, limit: ?usize) !void {
     const retained = if (limit) |max| delta[0..@min(delta.len, max -| content.items.len)] else delta;
     try content.appendSlice(alloc, retained);
-    callback(ctx, delta);
+    events.emit(.{ .content_delta = delta });
 }
 
 fn findTool(tools: []ToolAccumulator, id: ?[]const u8) ?*ToolAccumulator {
@@ -777,7 +831,7 @@ fn mapAnthropicFinish(reason: ?[]const u8) ?types.ProviderFinishReason {
     return .other;
 }
 
-fn freeCompletion(alloc: Allocator, completion: *types.GatewayCompletion) void {
+fn freeCompletion(alloc: Allocator, completion: *types.ModelCompletion) void {
     if (completion.content) |content| alloc.free(@constCast(content));
     types.freeToolCallSlice(alloc, @constCast(completion.tool_calls));
     completion.* = .{};
@@ -795,32 +849,32 @@ const TestCapture = struct {
         self.tool_input.deinit(alloc);
     }
 
-    fn onContent(raw: *anyopaque, chunk: []const u8) void {
+    fn emit(raw: *anyopaque, event: stream_provider.Event) void {
         const self: *@This() = @ptrCast(@alignCast(raw));
-        self.content.appendSlice(std.testing.allocator, chunk) catch unreachable;
-    }
-
-    fn onReasoning(raw: *anyopaque, chunk: []const u8) void {
-        const self: *@This() = @ptrCast(@alignCast(raw));
-        self.reasoning.appendSlice(std.testing.allocator, chunk) catch unreachable;
-    }
-
-    fn onToolInput(raw: *anyopaque, chunk: []const u8) void {
-        const self: *@This() = @ptrCast(@alignCast(raw));
-        self.tool_input.appendSlice(std.testing.allocator, chunk) catch unreachable;
-    }
-
-    fn onToolStart(raw: *anyopaque, _: []const u8, _: []const u8, _: ?[]const u8) void {
-        const self: *@This() = @ptrCast(@alignCast(raw));
-        self.tool_starts += 1;
+        switch (event) {
+            .content_delta => |chunk| self.content.appendSlice(std.testing.allocator, chunk) catch unreachable,
+            .reasoning_delta => |chunk| self.reasoning.appendSlice(std.testing.allocator, chunk) catch unreachable,
+            .tool_input_delta => |chunk| self.tool_input.appendSlice(std.testing.allocator, chunk) catch unreachable,
+            .tool_started => self.tool_starts += 1,
+        }
     }
 };
 
-fn testBuildRequest(model: []const u8, messages: []const types.ChatMessage, tools: []const u8) stream_provider.BuildRequest {
+fn testBuildRequest(model: []const u8, messages: []const types.ChatMessage) stream_provider.RequestData {
+    const read_file = model_tool_schema.FunctionSchema{
+        .name = "read_file",
+        .description = "Read",
+        .input_schema = .{},
+    };
+    const vision = model_tool_schema.FunctionSchema{
+        .name = "vision",
+        .description = "Inspect image",
+        .input_schema = .{},
+    };
     return .{
         .model = model,
-        .serialized_tools = tools,
         .messages = messages,
+        .tools = .{ .additional_functions = &.{ read_file, vision } },
         .tool_choice = .auto,
         .provider_options = .{},
         .max_output_tokens = 4096,
@@ -832,27 +886,25 @@ test "direct request builders project native Anthropic and Responses shapes" {
         .{ .role = .system, .content = "Be precise." },
         .{ .role = .user, .content = "Read it." },
     };
-    const tools = "[{\"type\":\"provider\",\"id\":\"gateway.perplexity_search\",\"name\":\"perplexity_search\",\"args\":{}},{\"type\":\"function\",\"name\":\"vision\",\"description\":\"Inspect image\",\"inputSchema\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"read_file\",\"description\":\"Read\",\"inputSchema\":{\"type\":\"object\"}}]";
-
-    const anthropic = try agent_stream_provider.build(std.testing.allocator, testBuildRequest("anthropic-max/claude-opus-4-1", &messages, tools));
+    const anthropic = try build(std.testing.allocator, testBuildRequest("anthropic-max/claude-opus-4-1", &messages));
     defer std.testing.allocator.free(anthropic);
     try std.testing.expect(std.mem.find(u8, anthropic, "\"model\":\"claude-opus-4-1\"") != null);
-    try std.testing.expect(std.mem.find(u8, anthropic, "\"input_schema\":{\"type\":\"object\"}") != null);
+    try std.testing.expect(std.mem.find(u8, anthropic, "\"input_schema\":{\"type\":\"object\"") != null);
     try std.testing.expect(std.mem.find(u8, anthropic, "gateway.perplexity_search") == null);
     try std.testing.expect(std.mem.find(u8, anthropic, "\"name\":\"vision\"") == null);
     try std.testing.expect(std.mem.find(u8, anthropic, claude_code_identity) != null);
 
-    const responses = try agent_stream_provider.build(std.testing.allocator, testBuildRequest("openai-codex/gpt-5.3-codex", &messages, tools));
+    const responses = try build(std.testing.allocator, testBuildRequest("openai-codex/gpt-5.3-codex", &messages));
     defer std.testing.allocator.free(responses);
     try std.testing.expect(std.mem.find(u8, responses, "\"model\":\"gpt-5.3-codex\"") != null);
     try std.testing.expect(std.mem.find(u8, responses, "\"instructions\":\"Be precise.\"") != null);
-    try std.testing.expect(std.mem.find(u8, responses, "\"parameters\":{\"type\":\"object\"}") != null);
+    try std.testing.expect(std.mem.find(u8, responses, "\"parameters\":{\"type\":\"object\"") != null);
     try std.testing.expect(std.mem.find(u8, responses, "gateway.perplexity_search") == null);
     try std.testing.expect(std.mem.find(u8, responses, "\"name\":\"vision\"") == null);
     try std.testing.expect(std.mem.find(u8, responses, "\"store\":false") != null);
     try std.testing.expect(std.mem.find(u8, responses, "max_output_tokens") == null);
 
-    try std.testing.expectError(error.AgentStreamProviderUnavailable, agent_stream_provider.build(std.testing.allocator, testBuildRequest("anthropic/claude", &messages, tools)));
+    try std.testing.expectError(error.AgentStreamProviderUnavailable, build(std.testing.allocator, testBuildRequest("anthropic/claude", &messages)));
 }
 
 test "Anthropic SSE normalizes text reasoning tool calls usage and finish" {
@@ -867,7 +919,7 @@ test "Anthropic SSE normalizes text reasoning tool calls usage and finish" {
     var capture: TestCapture = .{};
     defer capture.deinit(std.testing.allocator);
     var cancelled = std.atomic.Value(bool).init(false);
-    var completion = try consumeDirectSse(std.testing.allocator, &reader, .anthropic, &capture, TestCapture.onContent, TestCapture.onToolStart, TestCapture.onReasoning, TestCapture.onToolInput, &cancelled, null);
+    var completion = try consumeDirectSse(std.testing.allocator, &reader, .anthropic, .{ .context = &capture, .emit_fn = TestCapture.emit }, &cancelled, null);
     defer freeCompletion(std.testing.allocator, &completion);
 
     try std.testing.expectEqualStrings("hello", completion.content.?);
@@ -891,7 +943,7 @@ test "Responses SSE normalizes text reasoning tool calls usage and finish" {
     var capture: TestCapture = .{};
     defer capture.deinit(std.testing.allocator);
     var cancelled = std.atomic.Value(bool).init(false);
-    var completion = try consumeDirectSse(std.testing.allocator, &reader, .codex, &capture, TestCapture.onContent, TestCapture.onToolStart, TestCapture.onReasoning, TestCapture.onToolInput, &cancelled, null);
+    var completion = try consumeDirectSse(std.testing.allocator, &reader, .codex, .{ .context = &capture, .emit_fn = TestCapture.emit }, &cancelled, null);
     defer freeCompletion(std.testing.allocator, &completion);
 
     try std.testing.expectEqualStrings("answer", completion.content.?);
